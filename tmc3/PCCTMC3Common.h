@@ -41,6 +41,7 @@
 #include "constants.h"
 #include "hls.h"
 #include "geometry_predictive.h"
+#include "lod_scan_simd.h"
 
 #include "nanoflann.hpp"
 
@@ -90,6 +91,11 @@ public:
   const Box3<int32_t>& bBox(int32_t bindex, int32_t level) const
   {
     return _bBoxes[level][bindex];
+  }
+
+  const std::vector<Box3<int32_t>>& bBoxes(int32_t level) const
+  {
+    return _bBoxes[level];
   }
 
   int32_t bucketSizeLog2(int32_t level = 0) const
@@ -1252,7 +1258,17 @@ computeNearestNeighbors(
   }
   hBBoxes.update();
 
+  // structure-of-arrays copies for the bucketed candidate scans
+  LodScanPoints scanRetained;
+  LodScanBoxes scanRetainedBoxes[2];
+  if (kLodScanSimd)
+    scanRetained.build(biasedPos, retained.begin(), retainedSize);
+  for (int l = 0; l < 2; l++)
+    scanRetainedBoxes[l].build(hBBoxes.bBoxes(l));
+
   BoxHierarchy<bucketSizeLog2, levelCount> hIntraBBoxes;
+  LodScanPoints scanIntra;
+  LodScanBoxes scanIntraBoxes[2];
   if (lodIndex >= aps.intra_lod_prediction_skip_layers) {
     hIntraBBoxes.resize(indexesSize);
     for (int32_t i = startIndex, b = 0; i < endIndex; ++b) {
@@ -1263,6 +1279,13 @@ computeNearestNeighbors(
       }
     }
     hIntraBBoxes.update();
+
+    // NB: indexes[i] is rewritten as point i is processed, but the intra
+    //     scan only visits candidates after i, which keep their value.
+    if (kLodScanSimd)
+      scanIntra.build(biasedPos, indexes.begin() + startIndex, indexesSize);
+    for (int l = 0; l < 2; l++)
+      scanIntraBoxes[l].build(hIntraBBoxes.bBoxes(l));
   }
 
   const int32_t indexesSizeRef = endIndexRef - startIndexRef;
@@ -1328,6 +1351,44 @@ computeNearestNeighbors(
     pointIndexToPredictorIndex[pointIndex] = predIndex;
 
     int32_t index2 = 3;
+
+    // update the neighbour list with the k-th retained point
+    auto visitRetained = [&](int32_t k) {
+      if (aps.predictionWithDistributionEnabled) {
+        updateNearestNeighByDistanceAndDistributionWithCheck(
+          bpoint, biasedPos[retained[k]], k, index2, localIndexes,
+          minDistances, false, localRef, false);
+      } else {
+        updateNearestNeighWithCheck(
+          bpoint, biasedPos[retained[k]], k, localIndexes, minDistances,
+          false, localRef, false);
+      }
+    };
+
+    // update the neighbour list with the h-th point of the current lod
+    auto visitIntra = [&](int32_t h) {
+      const int32_t k = startIndex + h;
+      if (aps.predictionWithDistributionEnabled) {
+        updateNearestNeighByDistanceAndDistribution(
+          bpoint, biasedPos[indexes[k]], indexes[k], index2, localIndexes,
+          minDistances, false, localRef, false);
+      } else {
+        updateNearestNeigh(
+          bpoint, biasedPos[indexes[k]], indexes[k], localIndexes,
+          minDistances, false, localRef, false);
+      }
+    };
+
+    // bounding boxes at or beyond this distance cannot improve the list
+    auto pruneLimit = [&]() {
+      return localIndexes[2] != -1 ? minDistances[2]
+                                   : std::numeric_limits<int64_t>::max();
+    };
+
+    // bounding box distances of a run of up to one bucket of boxes
+    int32_t boxDist1[1 << bucketSizeLog2];
+    int32_t boxDist0[1 << bucketSizeLog2];
+
     if (retainedSize) {
       while (j < retainedSize - 1
              && mortonCode >= packedVoxel[retained[j]].mortonCode) {
@@ -1438,35 +1499,34 @@ computeNearestNeighbors(
           const auto alignedIndex1 = b2 << bucketSizeLog2;
           const auto start1 = std::max(b10, alignedIndex1);
           const auto end1 = std::min(b11, alignedIndex1 + bucketSizeMinus1);
-          for (int32_t b1 = start1; b1 <= end1; ++b1) {
+          for (uint32_t keep1 = lodBoxScan(
+                 scanRetainedBoxes[1], start1, end1, bpoint, pruneLimit(),
+                 boxDist1);
+               keep1;) {
+            const int32_t b1 = start1 + lodPopBit<false>(keep1);
             if (
               localIndexes[2] != -1
-              && hBBoxes.bBox(b1, 1).getDist1(bpoint) >= minDistances[2])
+              && boxDist1[b1 - start1] >= minDistances[2])
               continue;
 
             const auto alignedIndex0 = b1 << bucketSizeLog2;
             const auto start0 = std::max(b00, alignedIndex0);
             const auto end0 = std::min(b01, alignedIndex0 + bucketSizeMinus1);
-            for (int32_t b0 = start0; b0 <= end0; ++b0) {
+            for (uint32_t keep0 = lodBoxScan(
+                   scanRetainedBoxes[0], start0, end0, bpoint, pruneLimit(),
+                   boxDist0);
+                 keep0;) {
+              const int32_t b0 = start0 + lodPopBit<false>(keep0);
               if (
                 localIndexes[2] != -1
-                && hBBoxes.bBox(b0, 0).getDist1(bpoint) >= minDistances[2])
+                && boxDist0[b0 - start0] >= minDistances[2])
                 continue;
 
               const int32_t alignedIndex = b0 << bucketSizeLog2;
               const int32_t h0 = std::max(p1, alignedIndex);
               const int32_t h1 = std::min(k1, alignedIndex + bucketSizeMinus1);
-              for (int32_t k = h0; k <= h1; ++k) {
-                if (aps.predictionWithDistributionEnabled) {
-                  updateNearestNeighByDistanceAndDistributionWithCheck(
-                    bpoint, biasedPos[retained[k]], k, index2, localIndexes,
-                    minDistances, false, localRef, false);
-                } else {
-                  updateNearestNeighWithCheck(
-                    bpoint, biasedPos[retained[k]], k, localIndexes,
-                    minDistances, false, localRef, false);
-                }
-              }
+              lodScanCandidates<false>(
+                scanRetained, h0, h1, bpoint, minDistances[2], visitRetained);
             }
           }
         }
@@ -1487,35 +1547,34 @@ computeNearestNeighbors(
           const auto alignedIndex1 = c2 << bucketSizeLog2;
           const auto start1 = std::max(c10, alignedIndex1);
           const auto end1 = std::min(c11, alignedIndex1 + bucketSizeMinus1);
-          for (int32_t c1 = end1; c1 >= start1; --c1) {
+          for (uint32_t keep1 = lodBoxScan(
+                 scanRetainedBoxes[1], start1, end1, bpoint, pruneLimit(),
+                 boxDist1);
+               keep1;) {
+            const int32_t c1 = start1 + lodPopBit<true>(keep1);
             if (
               localIndexes[2] != -1
-              && hBBoxes.bBox(c1, 1).getDist1(bpoint) >= minDistances[2])
+              && boxDist1[c1 - start1] >= minDistances[2])
               continue;
 
             const auto alignedIndex0 = c1 << bucketSizeLog2;
             const auto start0 = std::max(c00, alignedIndex0);
             const auto end0 = std::min(c01, alignedIndex0 + bucketSizeMinus1);
-            for (int32_t c0 = end0; c0 >= start0; --c0) {
+            for (uint32_t keep0 = lodBoxScan(
+                   scanRetainedBoxes[0], start0, end0, bpoint, pruneLimit(),
+                   boxDist0);
+                 keep0;) {
+              const int32_t c0 = start0 + lodPopBit<true>(keep0);
               if (
                 localIndexes[2] != -1
-                && hBBoxes.bBox(c0, 0).getDist1(bpoint) >= minDistances[2])
+                && boxDist0[c0 - start0] >= minDistances[2])
                 continue;
 
               const int32_t alignedIndex = c0 << bucketSizeLog2;
               const int32_t h0 = std::max(k0, alignedIndex);
               const int32_t h1 = std::min(p0, alignedIndex + bucketSizeMinus1);
-              for (int32_t k = h1; k >= h0; --k) {
-                if (aps.predictionWithDistributionEnabled) {
-                  updateNearestNeighByDistanceAndDistributionWithCheck(
-                    bpoint, biasedPos[retained[k]], k, index2, localIndexes,
-                    minDistances, false, localRef, false);
-                } else {
-                  updateNearestNeighWithCheck(
-                    bpoint, biasedPos[retained[k]], k, localIndexes,
-                    minDistances, false, localRef, false);
-                }
-              }
+              lodScanCandidates<true>(
+                scanRetained, h0, h1, bpoint, minDistances[2], visitRetained);
             }
           }
         }
@@ -1568,36 +1627,34 @@ computeNearestNeighbors(
         const auto alignedIndex1 = b2 << bucketSizeLog2;
         const auto start1 = std::max(b10, alignedIndex1);
         const auto end1 = std::min(b11, alignedIndex1 + bucketSizeMinus1);
-        for (int32_t b1 = start1; b1 <= end1; ++b1) {
+        for (uint32_t keep1 = lodBoxScan(
+               scanIntraBoxes[1], start1, end1, bpoint, pruneLimit(),
+               boxDist1);
+             keep1;) {
+          const int32_t b1 = start1 + lodPopBit<false>(keep1);
           if (
             localIndexes[2] != -1
-            && hIntraBBoxes.bBox(b1, 1).getDist1(bpoint) >= minDistances[2])
+            && boxDist1[b1 - start1] >= minDistances[2])
             continue;
 
           const auto alignedIndex0 = b1 << bucketSizeLog2;
           const auto start0 = std::max(b00, alignedIndex0);
           const auto end0 = std::min(b01, alignedIndex0 + bucketSizeMinus1);
-          for (int32_t b0 = start0; b0 <= end0; ++b0) {
+          for (uint32_t keep0 = lodBoxScan(
+                 scanIntraBoxes[0], start0, end0, bpoint, pruneLimit(),
+                 boxDist0);
+               keep0;) {
+            const int32_t b0 = start0 + lodPopBit<false>(keep0);
             if (
               localIndexes[2] != -1
-              && hIntraBBoxes.bBox(b0, 0).getDist1(bpoint) >= minDistances[2])
+              && boxDist0[b0 - start0] >= minDistances[2])
               continue;
 
             const int32_t alignedIndex = b0 << bucketSizeLog2;
             const int32_t h0 = std::max(k0, alignedIndex);
             const int32_t h1 = std::min(k1, alignedIndex + bucketSizeMinus1);
-            for (int32_t h = h0; h <= h1; ++h) {
-              const int32_t k = startIndex + h;
-              if (aps.predictionWithDistributionEnabled) {
-                updateNearestNeighByDistanceAndDistribution(
-                  bpoint, biasedPos[indexes[k]], indexes[k], index2,
-                  localIndexes, minDistances, false, localRef, false);
-              } else {
-                updateNearestNeigh(
-                  bpoint, biasedPos[indexes[k]], indexes[k], localIndexes,
-                  minDistances, false, localRef, false);
-              }
-            }
+            lodScanCandidates<false>(
+              scanIntra, h0, h1, bpoint, minDistances[2], visitIntra);
           }
         }
       }

@@ -96,6 +96,7 @@ file(GLOB PROJECT_INC_FILES
   "hls.h"
   "io_hls.h"
   "io_tlv.h"
+  "lod_scan_simd.h"
   "motionWip.h"
   "osspecific.h"
   "partitioning.h"
