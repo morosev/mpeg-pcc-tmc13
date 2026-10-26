@@ -37,6 +37,11 @@
 
 #include <cmath>
 #include <cstdint>
+#include <vector>
+
+#if defined(__ARM_NEON)
+#  include <arm_neon.h>
+#endif
 
 #include "constants.h"
 #include "entropy.h"
@@ -254,14 +259,32 @@ public:
 
   Vec3<int32_t> operator()(Vec3<int32_t> sph)
   {
-    int64_t r = sph[0] << log2ScaleRadius;
-    int64_t z = divExp2RoundHalfInf(
-      tanThetaLaser[sph[2]] * r << 2, log2ScaleTheta - log2ScaleZ);
+    int64_t r = radius(sph[0]);
 
     return Vec3<int32_t>(Vec3<int64_t>{
-      divExp2RoundHalfInf(r * icos(sph[1], log2ScalePhi), kLog2ISineScale),
-      divExp2RoundHalfInf(r * isin(sph[1], log2ScalePhi), kLog2ISineScale),
-      divExp2RoundHalfInf(z - zLaser[sph[2]], log2ScaleZ)});
+      planar(r, icos(sph[1], log2ScalePhi)),
+      planar(r, isin(sph[1], log2ScalePhi)), height(r, sph[2])});
+  }
+
+  // The components of the conversion, for callers that evaluate several
+  // positions sharing a radius, azimuth or laser.
+
+  int64_t radius(int32_t sphR) const { return sphR << log2ScaleRadius; }
+
+  int azimuthScaleLog2() const { return log2ScalePhi; }
+
+  // x (or y) for the scaled radius r and the cosine (or sine) of the azimuth
+  static int64_t planar(int64_t r, int32_t trig)
+  {
+    return divExp2RoundHalfInf(r * trig, kLog2ISineScale);
+  }
+
+  // z for the scaled radius r and laser laserIdx
+  int64_t height(int64_t r, int laserIdx) const
+  {
+    int64_t z = divExp2RoundHalfInf(
+      tanThetaLaser[laserIdx] * r << 2, log2ScaleTheta - log2ScaleZ);
+    return divExp2RoundHalfInf(z - zLaser[laserIdx], log2ScaleZ);
   }
 
 private:
@@ -284,23 +307,16 @@ public:
     , numLasers(gps.angularTheta.size())
     , tanThetaLaser(gps.angularTheta.data())
     , zLaser(gps.angularZ.data())
-  {}
+  {
+#if defined(__ARM_NEON)
+    initLaserSearch();
+#endif
+  }
 
   Vec3<int32_t> operator()(Vec3<int32_t> xyz)
   {
     int64_t r0 = int64_t(std::round(hypot(xyz[0], xyz[1])));
-    int32_t thetaIdx = 0;
-    int32_t minError = std::numeric_limits<int32_t>::max();
-    for (int idx = 0; idx < numLasers; ++idx) {
-      int64_t z = divExp2RoundHalfInf(
-        tanThetaLaser[idx] * r0 << 2, log2ScaleTheta - log2ScaleZ);
-      int64_t z1 = divExp2RoundHalfInf(z - zLaser[idx], log2ScaleZ);
-      int32_t err = std::abs(z1 - xyz[2]);
-      if (err < minError) {
-        thetaIdx = idx;
-        minError = err;
-      }
-    }
+    int32_t thetaIdx = findLaser(r0, xyz[2]);
 
     auto phi0 = std::round((atan2(xyz[1], xyz[0]) / (2.0 * M_PI)) * scalePhi);
 
@@ -311,14 +327,31 @@ public:
     auto minErr = (sphToCartesian(sphPos) - xyz).getNorm1();
     int32_t dt0 = 0;
     int32_t dr0 = 0;
-    for (int32_t dt = -2; dt <= 2 && minErr; ++dt) {
-      for (int32_t dr = -2; dr <= 2; ++dr) {
-        auto sphPosCand = sphPos + Vec3<int32_t>{dr, dt, 0};
-        auto err = (sphToCartesian(sphPosCand) - xyz).getNorm1();
-        if (err < minErr) {
-          minErr = err;
-          dt0 = dt;
-          dr0 = dr;
+    if (minErr) {
+      // All candidates share the laser: z depends only upon the radius,
+      // and x, y upon the radius and azimuth.  Evaluate each once.
+      const int log2ScalePhi = sphToCartesian.azimuthScaleLog2();
+      int64_t rCand[5];
+      int32_t zErr[5], cosCand[5], sinCand[5];
+      for (int32_t d = -2; d <= 2; ++d) {
+        rCand[d + 2] = sphToCartesian.radius(sphPos[0] + d);
+        zErr[d + 2] = std::abs(
+          int32_t(sphToCartesian.height(rCand[d + 2], thetaIdx)) - xyz[2]);
+        cosCand[d + 2] = icos(sphPos[1] + d, log2ScalePhi);
+        sinCand[d + 2] = isin(sphPos[1] + d, log2ScalePhi);
+      }
+
+      for (int32_t dt = -2; dt <= 2 && minErr; ++dt) {
+        for (int32_t dr = -2; dr <= 2; ++dr) {
+          const int64_t r = rCand[dr + 2];
+          int32_t x = int32_t(SphericalToCartesian::planar(r, cosCand[dt + 2]));
+          int32_t y = int32_t(SphericalToCartesian::planar(r, sinCand[dt + 2]));
+          auto err = std::abs(x - xyz[0]) + std::abs(y - xyz[1]) + zErr[dr + 2];
+          if (err < minErr) {
+            minErr = err;
+            dt0 = dt;
+            dr0 = dr;
+          }
         }
       }
     }
@@ -329,6 +362,110 @@ public:
   }
 
 private:
+  // The first laser whose height at radius r0 is closest to z.
+  int32_t findLaser(int64_t r0, int32_t z)
+  {
+#if defined(__ARM_NEON)
+    if (r0 <= laserSearchMaxR && std::abs(z) <= kLaserSearchMaxAbs)
+      return findLaserNeon(uint32_t(r0), z);
+#endif
+    int32_t thetaIdx = 0;
+    int32_t minError = std::numeric_limits<int32_t>::max();
+    for (int idx = 0; idx < numLasers; ++idx) {
+      int64_t z0 = divExp2RoundHalfInf(
+        tanThetaLaser[idx] * r0 << 2, log2ScaleTheta - log2ScaleZ);
+      int64_t z1 = divExp2RoundHalfInf(z0 - zLaser[idx], log2ScaleZ);
+      int32_t err = std::abs(z1 - z);
+      if (err < minError) {
+        thetaIdx = idx;
+        minError = err;
+      }
+    }
+    return thetaIdx;
+  }
+
+#if defined(__ARM_NEON)
+  // Bound on the magnitude of intermediate values in the 32-bit search
+  static constexpr int32_t kLaserSearchMaxAbs = 1 << 28;
+
+  void initLaserSearch()
+  {
+    // NB: the search is disabled by a negative radius limit
+    laserSearchMaxR = -1;
+    const int padded = (numLasers + 3) & ~3;
+    if (!numLasers || padded > kMaxLasers)
+      return;
+
+    absTan.assign(padded, 0);
+    tanSign.assign(padded, 0);
+    zOffset.assign(padded, 0);
+    // padding lanes never attain the minimum
+    errFloor.assign(padded, std::numeric_limits<int32_t>::max());
+    std::fill_n(errFloor.begin(), numLasers, 0);
+
+    uint32_t maxAbsTan = 0;
+    for (int idx = 0; idx < numLasers; ++idx) {
+      if (std::abs(int64_t(zLaser[idx])) > kLaserSearchMaxAbs)
+        return;
+      absTan[idx] = uint32_t(std::abs(int64_t(tanThetaLaser[idx])));
+      tanSign[idx] = tanThetaLaser[idx] < 0 ? -1 : 0;
+      zOffset[idx] = zLaser[idx];
+      maxAbsTan = std::max(maxAbsTan, absTan[idx]);
+    }
+
+    // |z| = |tan| * r0 * 4 / 2^17 must not exceed kLaserSearchMaxAbs
+    const int64_t maxProduct = int64_t(kLaserSearchMaxAbs) << 15;
+    laserSearchMaxR = maxAbsTan
+      ? std::min<int64_t>(maxProduct / maxAbsTan, UINT32_MAX)
+      : UINT32_MAX;
+  }
+
+  int32_t findLaserNeon(uint32_t r0, int32_t z)
+  {
+    // NB: r0 >= 0, so rounding tan * r0 * 4 / 2^17 half away from zero is
+    //     sign(tan) * ((|tan| * r0 + 2^14) >> 15), a rounding narrow shift.
+    //     Every subsequent value fits in 32 bits by construction.
+    int32_t err[kMaxLasers];
+    const int padded = int(absTan.size());
+    const uint32x4_t vr0 = vdupq_n_u32(r0);
+    const int32x4_t vz = vdupq_n_s32(z);
+    int32x4_t vmin = vdupq_n_s32(std::numeric_limits<int32_t>::max());
+    for (int idx = 0; idx < padded; idx += 4) {
+      uint32x4_t t = vld1q_u32(&absTan[idx]);
+      uint32x2_t lo =
+        vrshrn_n_u64(vmull_u32(vget_low_u32(t), vget_low_u32(vr0)), 15);
+      uint32x4_t q = vrshrn_high_n_u64(lo, vmull_high_u32(t, vr0), 15);
+      int32x4_t s = vld1q_s32(&tanSign[idx]);
+      int32x4_t z0 = vsubq_s32(veorq_s32(vreinterpretq_s32_u32(q), s), s);
+
+      // divExp2RoundHalfInf(z0 - zLaser, 3)
+      int32x4_t d = vsubq_s32(z0, vld1q_s32(&zOffset[idx]));
+      int32x4_t ds = vshrq_n_s32(d, 31);
+      uint32x4_t a = vrshrq_n_u32(vreinterpretq_u32_s32(vabsq_s32(d)), 3);
+      int32x4_t z1 = vsubq_s32(veorq_s32(vreinterpretq_s32_u32(a), ds), ds);
+
+      int32x4_t e = vabdq_s32(z1, vz);
+      e = vmaxq_s32(e, vld1q_s32(&errFloor[idx]));
+      vst1q_s32(&err[idx], e);
+      vmin = vminq_s32(vmin, e);
+    }
+
+    // the first laser attaining the minimum, as the scalar search
+    const int32_t minError = vminvq_s32(vmin);
+    int idx = 0;
+    while (err[idx] != minError)
+      idx++;
+    return idx;
+  }
+
+  static constexpr int kMaxLasers = 256;
+  std::vector<uint32_t> absTan;
+  std::vector<int32_t> tanSign;
+  std::vector<int32_t> zOffset;
+  std::vector<int32_t> errFloor;
+  int64_t laserSearchMaxR;
+#endif
+
   SphericalToCartesian sphToCartesian;
   static constexpr int32_t log2ScaleZ = 3;
   static constexpr int32_t log2ScaleTheta = 20;

@@ -70,9 +70,23 @@ namespace {
 //============================================================================
 
 namespace {
+  // -log2(p / 128) for each 7-bit symbol probability p
+  struct EstimateTable {
+    float bits[128];
+
+    EstimateTable()
+    {
+      bits[0] = 0;
+      for (int p = 1; p < 128; ++p)
+        bits[p] = -log2(p / 128.);
+    }
+  };
+
+  const EstimateTable kEstimateTable;
+
   float estimate(bool bit, AdaptiveBitModel& model)
   {
-    return -log2(dirac::approxSymbolProbability(bit, model) / 128.);
+    return kEstimateTable.bits[dirac::approxSymbolProbability(bit, model)];
   }
 }  // namespace
 

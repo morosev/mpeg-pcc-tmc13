@@ -38,6 +38,7 @@
 #include "PCCMisc.h"
 #include "PCCPointSet.h"
 
+#include <algorithm>
 #include <fstream>
 #include <string>
 #include <vector>
@@ -184,6 +185,35 @@ ply::write(
   fout.close();
   return true;
 }
+
+//============================================================================
+// Sequential reads from an in-memory block, with the end of data behaviour
+// of std::istream::read: a short read copies the remaining bytes and sets eof.
+
+namespace {
+  class BlockReader {
+  public:
+    BlockReader(const char* begin, const char* end) : _p(begin), _end(end) {}
+
+    void read(char* dst, size_t n)
+    {
+      const size_t avail = size_t(_end - _p);
+      if (n > avail) {
+        n = avail;
+        _eof = true;
+      }
+      std::copy(_p, _p + n, dst);
+      _p += n;
+    }
+
+    bool eof() const { return _eof; }
+
+  private:
+    const char* _p;
+    const char* _end;
+    bool _eof = false;
+  };
+}  // namespace
 
 //============================================================================
 
@@ -428,74 +458,87 @@ ply::read(
       ++pointCounter;
     }
   } else {
-    for (size_t pointCounter = 0; pointCounter < pointCount && !ifs.eof();
+    // NB: the remainder of the file is read as a single block and then
+    //     parsed, rather than read one property at a time from the stream.
+    //     The block is not sized from the property byte counts, since some
+    //     property types are consumed without having a known byte count.
+    const auto dataStart = ifs.tellg();
+    ifs.seekg(0, std::ios::end);
+    const size_t available = size_t(ifs.tellg() - dataStart);
+    ifs.seekg(dataStart);
+
+    std::vector<char> block(available);
+    ifs.read(block.data(), block.size());
+    BlockReader in(block.data(), block.data() + ifs.gcount());
+
+    for (size_t pointCounter = 0; pointCounter < pointCount && !in.eof();
          ++pointCounter) {
       auto& position = cloud[pointCounter];
-      for (size_t a = 0; a < attributeCount && !ifs.eof(); ++a) {
+      for (size_t a = 0; a < attributeCount && !in.eof(); ++a) {
         const auto& attributeInfo = attributesInfo[a];
         if (a == indexX) {
           if (attributeInfo.byteCount == 4) {
             float x;
-            ifs.read(reinterpret_cast<char*>(&x), sizeof(float));
+            in.read(reinterpret_cast<char*>(&x), sizeof(float));
             position[0] = x * positionScale;
           } else {
             double x;
-            ifs.read(reinterpret_cast<char*>(&x), sizeof(double));
+            in.read(reinterpret_cast<char*>(&x), sizeof(double));
             position[0] = x * positionScale;
           }
         } else if (a == indexY) {
           if (attributeInfo.byteCount == 4) {
             float y;
-            ifs.read(reinterpret_cast<char*>(&y), sizeof(float));
+            in.read(reinterpret_cast<char*>(&y), sizeof(float));
             position[1] = y * positionScale;
           } else {
             double y;
-            ifs.read(reinterpret_cast<char*>(&y), sizeof(double));
+            in.read(reinterpret_cast<char*>(&y), sizeof(double));
             position[1] = y * positionScale;
           }
         } else if (a == indexZ) {
           if (attributeInfo.byteCount == 4) {
             float z;
-            ifs.read(reinterpret_cast<char*>(&z), sizeof(float));
+            in.read(reinterpret_cast<char*>(&z), sizeof(float));
             position[2] = z * positionScale;
           } else {
             double z;
-            ifs.read(reinterpret_cast<char*>(&z), sizeof(double));
+            in.read(reinterpret_cast<char*>(&z), sizeof(double));
             position[2] = z * positionScale;
           }
         } else if (a == indexR && attributeInfo.byteCount == 1) {
           uint8_t val8b;
-          ifs.read(reinterpret_cast<char*>(&val8b), sizeof(uint8_t));
+          in.read(reinterpret_cast<char*>(&val8b), sizeof(uint8_t));
           cloud.getColor(pointCounter)[2] = val8b;
         } else if (a == indexG && attributeInfo.byteCount == 1) {
           uint8_t val8b;
-          ifs.read(reinterpret_cast<char*>(&val8b), sizeof(uint8_t));
+          in.read(reinterpret_cast<char*>(&val8b), sizeof(uint8_t));
           cloud.getColor(pointCounter)[0] = val8b;
         } else if (a == indexB && attributeInfo.byteCount == 1) {
           uint8_t val8b;
-          ifs.read(reinterpret_cast<char*>(&val8b), sizeof(uint8_t));
+          in.read(reinterpret_cast<char*>(&val8b), sizeof(uint8_t));
           cloud.getColor(pointCounter)[1] = val8b;
         } else if (a == indexReflectance && attributeInfo.byteCount <= 2) {
           if (attributeInfo.byteCount == 1) {
             uint8_t reflectance;
-            ifs.read(reinterpret_cast<char*>(&reflectance), sizeof(uint8_t));
+            in.read(reinterpret_cast<char*>(&reflectance), sizeof(uint8_t));
             cloud.getReflectance(pointCounter) = reflectance;
           } else {
             auto& reflectance = cloud.getReflectance(pointCounter);
-            ifs.read(reinterpret_cast<char*>(&reflectance), sizeof(uint16_t));
+            in.read(reinterpret_cast<char*>(&reflectance), sizeof(uint16_t));
           }
         } else if (a == indexFrame && attributeInfo.byteCount <= 2) {
           if (attributeInfo.byteCount == 1) {
             auto& findex = cloud.getFrameIndex(pointCounter);
-            ifs.read(reinterpret_cast<char*>(&findex), sizeof(uint8_t));
+            in.read(reinterpret_cast<char*>(&findex), sizeof(uint8_t));
           } else {
             uint16_t findex;
-            ifs.read(reinterpret_cast<char*>(&findex), sizeof(uint16_t));
+            in.read(reinterpret_cast<char*>(&findex), sizeof(uint16_t));
             cloud.getFrameIndex(pointCounter) = uint8_t(findex);
           }
         } else {
           char buffer[128];
-          ifs.read(buffer, attributeInfo.byteCount);
+          in.read(buffer, attributeInfo.byteCount);
         }
       }
     }

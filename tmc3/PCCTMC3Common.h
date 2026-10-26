@@ -956,7 +956,7 @@ updateNearestNeighByDistanceAndDistribution(
   int32_t (&localIndexes)[6],
   int64_t (&minDistances)[6],
   bool interRef,
-  std::vector<bool>& localRef,
+  bool (&localRef)[6],
   bool predRef
   )
 {
@@ -1037,7 +1037,7 @@ updateNearestNeigh(
   int32_t (&localIndexes)[6],
   int64_t (&minDistances)[6],
   bool interRef,
-  std::vector<bool>& localRef,
+  bool (&localRef)[6],
   bool predRef)
 {
   auto d = (point0 - point1).getNorm1();
@@ -1091,7 +1091,7 @@ updateNearestNeighByDistanceAndDistributionWithCheck(
   int32_t (&localIndexes)[6],
   int64_t (&minDistances)[6],
   bool interRef,
-  std::vector<bool>& localRef,
+  bool (&localRef)[6],
   bool predRef
 
   )
@@ -1127,7 +1127,7 @@ updateNearestNeighWithCheck(
   int32_t (&localIndexes)[6],
   int64_t (&minDistances)[6],
   bool interRef,
-  std::vector<bool>& localRef,
+  bool (&localRef)[6],
   bool predRef
 
 )
@@ -1336,7 +1336,7 @@ computeNearestNeighbors(
                                std::numeric_limits<int64_t>::max(),
                                std::numeric_limits<int64_t>::max()};
 
-    std::vector<bool> localRef = {false, false, false, false, false, false};
+    bool localRef[6] = {false, false, false, false, false, false};
 
     const int32_t index = indexes[i];
     const auto& pv = packedVoxel[index];

@@ -44,8 +44,13 @@
 #include <iomanip>
 #include <iostream>
 #include <iterator>
+#include <limits>
 #include <string>
 #include <vector>
+
+#if defined(__ARM_NEON)
+#  include <arm_neon.h>
+#endif
 
 #include "PCCMath.h"
 #include "PCCMisc.h"
@@ -603,6 +608,57 @@ swap(PCCPointSet3& a, PCCPointSet3& b)
 
 //============================================================================
 
+#if defined(__ARM_NEON)
+// NEON form of the laser search in findLaserPrecise, for rInv < 2^32.
+// NB: (|zS3| * rInv) >> 17 is a 32x32-bit product shifted and truncated to
+//     32 bits, as is the scalar int conversion; the sign is then restored.
+
+static const int kFindLaserNeonMax = 256;
+
+static inline int findLaserPreciseNeon(
+  int32_t z, uint32_t rInv, const int* thetaList, const int* zList,
+  const int numTheta)
+{
+  int32_t dist[kFindLaserNeonMax];
+  const int32x4_t z8 = vdupq_n_s32(z << 3);
+  const uint32x4_t vrInv = vdupq_n_u32(rInv);
+  int32x4_t vmin = vdupq_n_s32(std::numeric_limits<int>::max());
+
+  int l = 0;
+  for (; l + 3 < numTheta; l += 4) {
+    int32x4_t zS3 = vaddq_s32(z8, vld1q_s32(zList + l));
+    int32x4_t sign = vshrq_n_s32(zS3, 31);
+    uint32x4_t a = vreinterpretq_u32_s32(vabsq_s32(zS3));
+    uint32x2_t lo =
+      vshrn_n_u64(vmull_u32(vget_low_u32(a), vget_low_u32(vrInv)), 14 + 3);
+    uint32x4_t q = vshrn_high_n_u64(lo, vmull_high_u32(a, vrInv), 14 + 3);
+    int32x4_t theta32 =
+      vsubq_s32(veorq_s32(vreinterpretq_s32_u32(q), sign), sign);
+    int32x4_t d = vabsq_s32(vsubq_s32(theta32, vld1q_s32(thetaList + l)));
+    vst1q_s32(dist + l, d);
+    vmin = vminq_s32(vmin, d);
+  }
+
+  int dBest = vminvq_s32(vmin);
+  for (; l < numTheta; l++) {
+    int zS3 = (z << 3) + zList[l];
+    int theta32 =
+      zS3 >= 0 ? (zS3 * int64_t(rInv)) >> (14 + 3)
+               : -((-zS3 * int64_t(rInv)) >> (14 + 3));
+    dist[l] = std::abs(theta32 - thetaList[l]);
+    dBest = std::min(dBest, dist[l]);
+  }
+
+  // the first laser attaining the minimum, as the scalar search
+  int lBest = 0;
+  while (dist[lBest] != dBest)
+    lBest++;
+  return lBest;
+}
+#endif
+
+//----------------------------------------------------------------------------
+
 static inline int findLaserPrecise(
   pcc::point_t point,
   const int* thetaList,
@@ -615,6 +671,12 @@ static inline int findLaserPrecise(
   int64_t xLidar = int64_t(point[0]) << 8;
   int64_t yLidar = int64_t(point[1]) << 8;
   int64_t rInv = irsqrt(xLidar * xLidar + yLidar * yLidar);
+
+#if defined(__ARM_NEON)
+  if (rInv >= 0 && rInv <= UINT32_MAX && numTheta <= kFindLaserNeonMax)
+    return findLaserPreciseNeon(
+      point[2], uint32_t(rInv), thetaList, zList, numTheta);
+#endif
 
   int lBest = 0;
   int dBest = std::numeric_limits<int>::max();
