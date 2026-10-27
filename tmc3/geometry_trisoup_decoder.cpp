@@ -41,6 +41,7 @@
 #include "geometry.h"
 #include "geometry_octree.h"
 #include "lod_scan_simd.h"
+#include "parallel.h"
 
 namespace pcc {
 
@@ -433,7 +434,7 @@ void determineTrisoupNeighbours(
         if (Vidx != -1)  // check if already coded
           pattern[patternIndex[indexLow][v]] = Vidx;
         else
-          std::cout << "#" << indexLow << "/" << v << " ";
+          codingLog() << "#" << indexLow << "/" << v << " ";
 
       }
     }

@@ -38,6 +38,7 @@
 
 #include <cstdint>
 #include <functional>
+#include <ostream>
 
 namespace pcc {
 
@@ -72,6 +73,26 @@ void parallelFor(
 // Run a and b, possibly concurrently, and return once both have completed.
 void parallelInvoke(
   const std::function<void()>& a, const std::function<void()>& b);
+
+//----------------------------------------------------------------------------
+// The stream for the coding messages of the current thread: std::cout,
+// unless redirected (eg, to keep the messages of a slice coded concurrently
+// with others in order).
+
+std::ostream& codingLog();
+
+// Redirects codingLog() on the current thread while the object exists.
+class CodingLogRedirect {
+public:
+  explicit CodingLogRedirect(std::ostream& os);
+  ~CodingLogRedirect();
+
+  CodingLogRedirect(const CodingLogRedirect&) = delete;
+  CodingLogRedirect& operator=(const CodingLogRedirect&) = delete;
+
+private:
+  std::ostream* _prev;
+};
 
 //============================================================================
 

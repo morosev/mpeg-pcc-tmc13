@@ -51,6 +51,7 @@
 #include "io_tlv.h"
 #include "pcc_chrono.h"
 #include "osspecific.h"
+#include "parallel.h"
 
 namespace pcc {
 
@@ -302,6 +303,18 @@ int
 PCCTMC3Decoder3::decompress(
   const PayloadBuffer* buf, PCCTMC3Decoder3::Callbacks* callback)
 {
+  // Queued slices are decoded before any data unit that ends the frame or
+  // changes the decoder state; only slice data of the same frame is queued
+  if (!_pendingSlices.empty()) {
+    bool sliceData = buf
+      && (buf->type == PayloadType::kAttributeBrick
+          || buf->type == PayloadType::kConstantAttribute
+          || (buf->type == PayloadType::kGeometryBrick
+              && !peekFrameBoundary(*buf)));
+    if (!sliceData)
+      decodePendingSlices();
+  }
+
   // Starting a new geometry brick/slice/tile, transfer any
   // finished points to the output accumulator
   if (!buf || payloadStartsNewSlice(buf->type)) {
@@ -385,11 +398,26 @@ PCCTMC3Decoder3::decompress(
     // Avoid dropping an actual frame
     _suppressOutput = false;
 
+    if (canDecodeSlicesInParallel()) {
+      queueSlice(*buf);
+      return 0;
+    }
+
     return decodeGeometryBrick(*buf);
 
-  case PayloadType::kAttributeBrick: decodeAttributeBrick(*buf); return 0;
+  case PayloadType::kAttributeBrick:
+    if (!_pendingSlices.empty()) {
+      queueSliceData(*buf);
+      return 0;
+    }
+    decodeAttributeBrick(*buf);
+    return 0;
 
   case PayloadType::kConstantAttribute:
+    if (!_pendingSlices.empty()) {
+      queueSliceData(*buf);
+      return 0;
+    }
     decodeConstantAttribute(*buf);
     return 0;
 
@@ -415,6 +443,182 @@ PCCTMC3Decoder3::decompress(
 
   // todo(df): error, unhandled payload type
   return 1;
+}
+
+//==========================================================================
+// Parallel decoding of the slices of a frame.
+//
+// Without inter prediction and entropy continuation, each slice is decoded
+// from reset contexts.  The slices of a frame are then queued, each with
+// its own decoder initialised from the frame-level state at the time the
+// slice starts, and decoded concurrently once the frame (or the state that
+// the slices depend on) ends.  The results and messages are merged in slice
+// order, as if the slices had been decoded one after the other.
+
+bool
+PCCTMC3Decoder3::canDecodeSlicesInParallel() const
+{
+  return numThreads() > 1 && _sps && _gps
+    && !_sps->inter_frame_prediction_enabled_flag
+    && !_sps->entropy_continuation_enabled_flag
+    && !_sps->inter_entropy_continuation_enabled_flag
+    && !_gps->interPredictionEnabledFlag && !_gps->biPredictionEnabledFlag
+    && !_gps->globalMotionEnabled && !_params.decodeMaxPoints
+    && !_params.minGeomNodeSizeLog2;
+}
+
+//--------------------------------------------------------------------------
+// Whether the geometry brick buf starts a new frame (see
+// dectectFrameBoundary), without updating the frame counter.
+
+bool
+PCCTMC3Decoder3::peekFrameBoundary(const PayloadBuffer& buf)
+{
+  activateParameterSets(parseGbhIds(buf));
+  auto gbh = parseGbh(*_sps, *_gps, buf, nullptr, nullptr);
+  return _frameCtr.isDifferentFrame(gbh.frame_ctr_lsb, _sps->frame_ctr_bits);
+}
+
+//--------------------------------------------------------------------------
+
+void
+PCCTMC3Decoder3::queueSlice(const PayloadBuffer& buf)
+{
+  std::unique_ptr<PCCTMC3Decoder3> worker(new PCCTMC3Decoder3(_params));
+  worker->_spss = _spss;
+  worker->_gpss = _gpss;
+  worker->_apss = _apss;
+  worker->_tileInventory = _tileInventory;
+  worker->_frameCtr = _frameCtr;
+  worker->_outCloud = _outCloud;
+  worker->_outCloud.cloud.clear();
+  worker->_outputInitialized = _outputInitialized;
+  worker->_suppressOutput = false;
+  worker->_ctxtMemAttrSliceIds = _ctxtMemAttrSliceIds;
+  worker->activateParameterSets(parseGbhIds(buf));
+
+  // The prediction state, as initialised by the first frame
+  // NB: within a frame, the first slice advances the reference frame state
+  //     (updateFrame), which slices without inter prediction do not use
+  worker->_refFrameSph = _refFrameSph;
+  worker->biPredDecodeParams = biPredDecodeParams;
+  worker->minPos_ref = minPos_ref;
+  worker->motionVectorFileName = motionVectorFileName;
+
+  // The slice state as left by the previous slice of the frame
+  if (_pendingSlices.empty()) {
+    worker->_firstSliceInFrame = _firstSliceInFrame;
+    worker->_sliceId = _sliceId;
+  } else {
+    worker->_firstSliceInFrame = false;
+    worker->_sliceId =
+      parseGbhIds(_pendingSlices.back().dataUnits.front()).geom_slice_id;
+  }
+
+  worker->_logBuffer.reset(new std::ostringstream);
+  worker->_log = worker->_logBuffer.get();
+
+  _pendingSlices.push_back({std::move(worker), {buf}});
+
+  // NB: the previous slice has been transferred to the output, and would
+  //     be replaced here when decoding the slice in place
+  _currentPointCloud.clear();
+}
+
+//--------------------------------------------------------------------------
+
+void
+PCCTMC3Decoder3::queueSliceData(const PayloadBuffer& buf)
+{
+  // NB: with attribute inter prediction, an attribute brick uses the slice
+  //     previously decoded as a reference
+  if (buf.type == PayloadType::kAttributeBrick) {
+    AttributeBrickHeader abh = parseAbhIds(buf);
+    const auto it = _apss.find(abh.attr_attr_parameter_set_id);
+    if (it != _apss.end() && it->second.attrInterPredictionEnabled) {
+      int abhSize;
+      abh = parseAbh(*_sps, it->second, buf, &abhSize);
+      if (abh.enableAttrInterPred)
+        _pendingSlicesInOrder = true;
+    }
+  }
+
+  _pendingSlices.back().dataUnits.push_back(buf);
+}
+
+//--------------------------------------------------------------------------
+
+void
+PCCTMC3Decoder3::decodePendingSlices()
+{
+  auto decodeDataUnit = [](PCCTMC3Decoder3& decoder, const PayloadBuffer& du) {
+    switch (du.type) {
+    case PayloadType::kGeometryBrick: decoder.decodeGeometryBrick(du); break;
+    case PayloadType::kAttributeBrick: decoder.decodeAttributeBrick(du); break;
+    case PayloadType::kConstantAttribute:
+      decoder.decodeConstantAttribute(du);
+      break;
+    default: break;
+    }
+  };
+
+  if (_pendingSlicesInOrder) {
+    // Decode the slices in order with this decoder, as if not queued
+    for (auto& slice : _pendingSlices) {
+      if (size_t numPoints = _currentPointCloud.getPointCount()) {
+        for (size_t i = 0; i < numPoints; i++)
+          for (int k = 0; k < 3; k++)
+            _currentPointCloud[i][k] += _sliceOrigin[k];
+        _accumCloud.append(_currentPointCloud);
+      }
+      _attrDecoder.reset();
+      for (const auto& du : slice.dataUnits)
+        decodeDataUnit(*this, du);
+    }
+  } else {
+    parallelFor(_pendingSlices.size(), 1, [&](int64_t begin, int64_t end) {
+      for (int64_t i = begin; i < end; i++) {
+        auto& slice = _pendingSlices[i];
+        CodingLogRedirect redirect(*slice.worker->_log);
+        for (const auto& du : slice.dataUnits)
+          decodeDataUnit(*slice.worker, du);
+      }
+    });
+
+    // Merge the slices in order
+    for (auto& slice : _pendingSlices) {
+      auto& worker = *slice.worker;
+      if (size_t numPoints = worker._currentPointCloud.getPointCount()) {
+        for (size_t i = 0; i < numPoints; i++)
+          for (int k = 0; k < 3; k++)
+            worker._currentPointCloud[i][k] += worker._sliceOrigin[k];
+        _accumCloud.append(worker._currentPointCloud);
+      }
+      _accumCloudAltPositions.append(worker._accumCloudAltPositions);
+      *_log << worker._logBuffer->str();
+    }
+
+    // The frame-level prediction state as advanced by the first slice
+    _refFrameSph = std::move(_pendingSlices.front().worker->_refFrameSph);
+
+    // The slice state as left by the last slice
+    auto& last = *_pendingSlices.back().worker;
+    biPredDecodeParams = std::move(last.biPredDecodeParams);
+    _sliceId = last._sliceId;
+    _prevSliceId = last._prevSliceId;
+    _firstSliceInFrame = false;
+    _sliceOrigin = last._sliceOrigin;
+    _gbh = last._gbh;
+    _ctxtMemAttrSliceIds = last._ctxtMemAttrSliceIds;
+    _posSph = std::move(last._posSph);
+    _reconSliceAltPositions = std::move(last._reconSliceAltPositions);
+    attrInterPredParams = std::move(last.attrInterPredParams);
+    minPos_ref = last.minPos_ref;
+    _currentPointCloud.clear();
+  }
+
+  _pendingSlices.clear();
+  _pendingSlicesInOrder = false;
 }
 
 //--------------------------------------------------------------------------
@@ -573,7 +777,7 @@ int
 PCCTMC3Decoder3::decodeGeometryBrick(const PayloadBuffer& buf)
 {
   assert(buf.type == PayloadType::kGeometryBrick);
-  std::cout << "positions bitstream size " << buf.size() << " B\n";
+  *_log << "positions bitstream size " << buf.size() << " B\n";
 
   // todo(df): replace with attribute mapping
   bool hasColour = std::any_of(
@@ -768,9 +972,9 @@ PCCTMC3Decoder3::decodeGeometryBrick(const PayloadBuffer& buf)
 
   auto total_user =
     std::chrono::duration_cast<std::chrono::milliseconds>(clock_user.count());
-  std::cout << "positions processing time (user): "
+  *_log << "positions processing time (user): "
             << total_user.count() / 1000.0 << " s\n";
-  std::cout << std::endl;
+  *_log << std::endl;
 
   return 0;
 }
@@ -978,14 +1182,14 @@ PCCTMC3Decoder3::decodeAttributeBrick(const PayloadBuffer& buf)
 
   clock_user.stop();
 
-  std::cout << label << "s bitstream size " << buf.size() << " B\n";
+  *_log << label << "s bitstream size " << buf.size() << " B\n";
 
   auto total_user =
     std::chrono::duration_cast<std::chrono::milliseconds>(clock_user.count());
-  std::cout << label
+  *_log << label
             << "s processing time (user): " << total_user.count() / 1000.0
             << " s\n";
-  std::cout << std::endl;
+  *_log << std::endl;
 }
 
 //--------------------------------------------------------------------------

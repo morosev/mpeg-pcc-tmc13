@@ -36,7 +36,12 @@
 #pragma once
 
 #include <functional>
+#include <iostream>
 #include <map>
+#include <memory>
+#include <ostream>
+#include <sstream>
+#include <vector>
 
 #include "Attribute.h"
 #include "PayloadBuffer.h"
@@ -109,6 +114,13 @@ private:
   void outputGOFCurrentCloud(Callbacks* callback);
   void processHierarchicalGOF();
   void processHierarchicalGOFPost();
+
+  // Parallel decoding of the slices of a frame
+  bool canDecodeSlicesInParallel() const;
+  bool peekFrameBoundary(const PayloadBuffer& buf);
+  void queueSlice(const PayloadBuffer& buf);
+  void queueSliceData(const PayloadBuffer& buf);
+  void decodePendingSlices();
 
   //==========================================================================
 
@@ -203,6 +215,25 @@ private:
   
   BiPredictionDecodeParams biPredDecodeParams;
   HierarchicalGOFParams hGOFDecodeParams;
+
+  // Destination of the slice decoding messages
+  std::ostream* _log = &std::cout;
+
+  // Slice decoding messages of a slice decoded by a worker
+  std::unique_ptr<std::ostringstream> _logBuffer;
+
+  // A slice queued for decoding, with its own decoder
+  struct PendingSlice {
+    std::unique_ptr<PCCTMC3Decoder3> worker;
+    std::vector<PayloadBuffer> dataUnits;
+  };
+
+  // The queued slices of the current frame
+  std::vector<PendingSlice> _pendingSlices;
+
+  // A queued slice depends on the previous slice (attribute inter
+  // prediction), and the slices must be decoded in order
+  bool _pendingSlicesInOrder = false;
 };
 
 //----------------------------------------------------------------------------

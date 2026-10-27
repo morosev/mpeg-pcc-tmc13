@@ -40,9 +40,17 @@
 #include <atomic>
 #include <condition_variable>
 #include <exception>
+#include <iostream>
 #include <mutex>
+#include <system_error>
 #include <thread>
 #include <vector>
+
+#if defined(__unix__) || defined(__APPLE__)
+#  define PCC_POSIX_THREADS 1
+#  include <pthread.h>
+#  include <sys/resource.h>
+#endif
 
 namespace pcc {
 
@@ -52,6 +60,29 @@ namespace {
 
   // Set while a thread executes chunks, so that nested calls run inline
   thread_local bool tlInParallel = false;
+
+  // The redirected coding message stream of the thread, if any
+  thread_local std::ostream* tlCodingLog = nullptr;
+
+#if defined(PCC_POSIX_THREADS)
+  //--------------------------------------------------------------------------
+  // The stack size of the worker threads: that of the main thread.
+  // NB: secondary threads otherwise get a much smaller stack (eg, 512 kB on
+  //     macOS) than the main thread (eg, 8 MB), which the coding functions,
+  //     with their large stack frames, can exceed.
+
+  size_t
+  workerStackSize()
+  {
+    size_t size = size_t(8) << 20;
+    struct rlimit limit;
+    if (
+      !getrlimit(RLIMIT_STACK, &limit) && limit.rlim_cur != RLIM_INFINITY
+      && limit.rlim_cur > size)
+      size = limit.rlim_cur;
+    return size;
+  }
+#endif
 
   //--------------------------------------------------------------------------
   // A pool of worker threads that execute the chunks of one job at a time,
@@ -69,12 +100,12 @@ namespace {
       }
       _wake.notify_all();
       for (auto& worker : _workers)
-        worker.join();
+        join(worker);
       _workers.clear();
 
       _stop = false;
       for (int i = 0; i < numWorkers; i++)
-        _workers.emplace_back([this] { workerLoop(); });
+        _workers.push_back(start());
     }
 
     // Run the job on the pool, or return false if the pool is busy
@@ -111,6 +142,40 @@ namespace {
     }
 
   private:
+#if defined(PCC_POSIX_THREADS)
+    using Worker = pthread_t;
+
+    Worker start()
+    {
+      pthread_attr_t attr;
+      pthread_attr_init(&attr);
+      pthread_attr_setstacksize(&attr, workerStackSize());
+      pthread_t thread;
+      int err = pthread_create(
+        &thread, &attr,
+        [](void* pool) -> void* {
+          static_cast<ThreadPool*>(pool)->workerLoop();
+          return nullptr;
+        },
+        this);
+      pthread_attr_destroy(&attr);
+      if (err)
+        throw std::system_error(err, std::generic_category(), "pthread_create");
+      return thread;
+    }
+
+    static void join(Worker& worker) { pthread_join(worker, nullptr); }
+#else
+    using Worker = std::thread;
+
+    Worker start()
+    {
+      return std::thread([this] { workerLoop(); });
+    }
+
+    static void join(Worker& worker) { worker.join(); }
+#endif
+
     void workerLoop()
     {
       uint64_t seen = 0;
@@ -155,7 +220,7 @@ namespace {
       tlInParallel = false;
     }
 
-    std::vector<std::thread> _workers;
+    std::vector<Worker> _workers;
 
     // Serialises jobs from different submitting threads
     std::mutex _runMutex;
@@ -236,6 +301,28 @@ parallelInvoke(const std::function<void()>& a, const std::function<void()>& b)
     for (int64_t i = begin; i < end; i++)
       (i ? b : a)();
   });
+}
+
+//============================================================================
+
+std::ostream&
+codingLog()
+{
+  return tlCodingLog ? *tlCodingLog : std::cout;
+}
+
+//----------------------------------------------------------------------------
+
+CodingLogRedirect::CodingLogRedirect(std::ostream& os) : _prev(tlCodingLog)
+{
+  tlCodingLog = &os;
+}
+
+//----------------------------------------------------------------------------
+
+CodingLogRedirect::~CodingLogRedirect()
+{
+  tlCodingLog = _prev;
 }
 
 //============================================================================
