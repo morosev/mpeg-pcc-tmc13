@@ -199,6 +199,10 @@ public:
   static void fixupParameterSets(EncoderParams* params);
   void setInterForCurrPic(bool x) { _codeCurrFrameAsInter = x; }
   void setMotionVectorFileName(std::string s) { motionVectorFileName = s; }
+
+  // Sets the destination of the coding messages (default: std::cout)
+  void setLog(std::ostream* log) { _log = log; }
+
   static void deriveMotionParams(EncoderParams* params);
   void setRefTimesList()
   {
@@ -319,7 +323,7 @@ private:
   BiPredictionEncodeParams biPredEncodeParams;
   HierarchicalGOFParams hGOFEncodeParams;
 
-  // Destination of the slice encoding messages
+  // Destination of the encoding messages
   std::ostream* _log = &std::cout;
 
   // Slice encoding messages of a slice encoded by a worker

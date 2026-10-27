@@ -386,7 +386,7 @@ PCCTMC3Encoder3::compress(
   if (partitions.tileInventory.tiles.size() > 1) {
     auto& inventory = partitions.tileInventory;
     assert(inventory.tiles.size() == tileMaps.size());
-    std::cout << "Tile number: " << tileMaps.size() << std::endl;
+    *_log << "Tile number: " << tileMaps.size() << std::endl;
     inventory.ti_seq_parameter_set_id = _sps->sps_seq_parameter_set_id;
     inventory.ti_origin_bits_minus1 =
       numBits(inventory.origin.abs().max()) - 1;
@@ -498,7 +498,7 @@ PCCTMC3Encoder3::compress(
       partitions.slices.insert(
         partitions.slices.end(), curSlices.begin(), curSlices.end());
     }
-    std::cout << "Slice number: " << partitions.slices.size() << std::endl;
+    *_log << "Slice number: " << partitions.slices.size() << std::endl;
   } while (0);
 
   if (_frameCounter) {

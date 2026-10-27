@@ -74,6 +74,12 @@ void parallelFor(
 void parallelInvoke(
   const std::function<void()>& a, const std::function<void()>& b);
 
+// Call fn on the calling thread if its stack is large enough for the coding
+// functions, otherwise on a temporary thread with the stack size of the main
+// thread (eg, for threads created by an application, which get a small
+// stack on some systems).  An exception thrown by fn is rethrown.
+void runWithCodingStack(const std::function<void()>& fn);
+
 //----------------------------------------------------------------------------
 // The stream for the coding messages of the current thread: std::cout,
 // unless redirected (eg, to keep the messages of a slice coded concurrently

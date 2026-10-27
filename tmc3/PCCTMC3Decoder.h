@@ -86,6 +86,12 @@ public:
 
   int decompress(const PayloadBuffer* buf, Callbacks* callback);
 
+  // Outputs the current frame now, rather than when the next frame starts.
+  // Must only be called once all data units of the frame have been passed
+  // to decompress().  Has no effect with bi-prediction, where frames are
+  // output in display order.
+  int endFrame(Callbacks* callback);
+
   //==========================================================================
 
   void storeSps(SequenceParameterSet&& sps);
@@ -95,6 +101,9 @@ public:
 
   //==========================================================================
   void setMotionVectorFileName(std::string s) { motionVectorFileName = s; }
+
+  // Sets the destination of the coding messages (default: std::cout)
+  void setLog(std::ostream* log) { _log = log; }
 
 private:
   void activateParameterSets(const AttributeParamInventoryHdr& gbh);
@@ -216,7 +225,10 @@ private:
   BiPredictionDecodeParams biPredDecodeParams;
   HierarchicalGOFParams hGOFDecodeParams;
 
-  // Destination of the slice decoding messages
+  // The current frame has been output by endFrame()
+  bool _frameEnded = false;
+
+  // Destination of the decoding messages
   std::ostream* _log = &std::cout;
 
   // Slice decoding messages of a slice decoded by a worker
@@ -240,7 +252,10 @@ private:
 
 class PCCTMC3Decoder3::Callbacks {
 public:
-  virtual void onOutputCloud(const CloudFrame&) = 0;
+  // Called for each decoded frame, in output order.  The callee may take
+  // frame.cloud (eg, by swapping it out): the decoder does not use it after
+  // the call.
+  virtual void onOutputCloud(CloudFrame& frame) = 0;
 };
 
 //============================================================================

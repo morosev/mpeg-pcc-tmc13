@@ -258,6 +258,34 @@ PCCTMC3Decoder3::outputGOFCurrentCloud(PCCTMC3Decoder3::Callbacks* callback)
 
 //============================================================================
 
+int
+PCCTMC3Decoder3::endFrame(PCCTMC3Decoder3::Callbacks* callback)
+{
+  if (!_outputInitialized || _frameEnded || _gps->biPredictionEnabledFlag)
+    return 0;
+
+  if (!_pendingSlices.empty())
+    decodePendingSlices();
+
+  // transfer the last slice to the output accumulator
+  if (size_t numPoints = _currentPointCloud.getPointCount()) {
+    for (size_t i = 0; i < numPoints; i++)
+      for (int k = 0; k < 3; k++)
+        _currentPointCloud[i][k] += _sliceOrigin[k];
+    _accumCloud.append(_currentPointCloud);
+    _currentPointCloud.clear();
+  }
+
+  // as for a frame boundary
+  storeCurrentCloudAsRef();
+  compensateZ();
+  outputCurrentCloud(callback);
+  _frameEnded = true;
+  return 0;
+}
+
+//============================================================================
+
 void
 PCCTMC3Decoder3::compensateZ()
 {
@@ -328,6 +356,9 @@ PCCTMC3Decoder3::decompress(
 
   if (!buf) {
     // flush decoder, output pending cloud if any
+    // NB: nothing to output if no frame has been decoded or output already
+    if (_frameEnded || !_gps)
+      return 0;
     if (_gps->biPredictionEnabledFlag)
       outputGOFCurrentCloud(callback);
     else{ 
@@ -342,7 +373,10 @@ PCCTMC3Decoder3::decompress(
   //  - this will activate the sps for GeometryBrick and AttrParamInventory
   //  - after outputing the current frame, the output must be reinitialized
   if (dectectFrameBoundary(buf)) {
-    if (_gps->biPredictionEnabledFlag) {
+    if (_frameEnded) {
+      // already output by endFrame()
+      _frameEnded = false;
+    } else if (_gps->biPredictionEnabledFlag) {
       storeCurrentCloudAsBRef();
       outputGOFCurrentCloud(callback);
     } else {

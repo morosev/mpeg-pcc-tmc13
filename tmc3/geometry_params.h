@@ -35,6 +35,8 @@
 
 #pragma once
 
+#include "parallel.h"
+
 namespace pcc {
 
 //=============================================================================
@@ -140,7 +142,7 @@ public:
   bool getMovingStatus() 
   {
     if (frameCounter > perFrameMovingStatus.size()) {
-      std::cout << "Accessing unassigned values\n";
+      codingLog() << "Accessing unassigned values\n";
     }
     return perFrameMovingStatus[frameCounter];
   }
@@ -164,7 +166,7 @@ public:
     std::pair<int, int>& th, std::vector<T>& mat, Vec3<int>& tr) const
   {
     if (frameCounter > threshVec.size()) {
-      std::cout << "Accessing unassigned values\n";
+      codingLog() << "Accessing unassigned values\n";
     }
     th = threshVec[frameCounter];
     mat.resize(9);
@@ -199,7 +201,7 @@ public:
     VecVecDouble& mat, const int _curPicIndex, const int _prePicIndex) const
   {
     if (_curPicIndex > threshVec.size() || _prePicIndex > threshVec.size()) {
-      std::cout << "Accessing unassigned values\n";
+      codingLog() << "Accessing unassigned values\n";
     }
     VecVecDouble mat_tmp = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, 0}};
     VecVecDouble mat_accum = {{1, 0, 0}, {0, 1, 0}, {0, 0, 1}, {0, 0, 0}};
@@ -286,7 +288,7 @@ public:
     const int _prePicIndex) const
   {
     if (_curPicIndex > threshVec.size() || _prePicIndex > threshVec.size()) {
-      std::cout << "Accessing unassigned values\n";
+      codingLog() << "Accessing unassigned values\n";
     }
 
     if (motionMatrix_double.size()){

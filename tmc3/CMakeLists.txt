@@ -111,6 +111,7 @@ file(GLOB PROJECT_INC_FILES
   "PCCTMC3Encoder.h"
   "RAHT.h"
   "TMC3.h"
+  "app_params.h"
   "attribute_raw.h"
   "colourspace.h"
   "coordinate_conversion.h"
@@ -158,7 +159,7 @@ file(GLOB PROJECT_CPP_FILES
   "FixedPoint.cpp"
   "OctreeNeighMap.cpp"
   "RAHT.cpp"
-  "TMC3.cpp"
+  "app_params.cpp"
   "attribute_raw_decoder.cpp"
   "attribute_raw_encoder.cpp"
   "coordinate_conversion.cpp"
@@ -202,16 +203,51 @@ include_directories(
   "${CMAKE_CURRENT_SOURCE_DIR}/../dependencies/program-options-lite"
 )
 
-add_executable (tmc3
+# Hide the symbols of the codec in the shared library (only the C
+# interface is exported)
+if (POLICY CMP0063)
+  cmake_policy(SET CMP0063 NEW)
+endif()
+
+# The codec, shared by the tmc3 application and the tmc3codec library
+add_library (tmc3core STATIC
   ${PROJECT_CPP_FILES}
   ${PROJECT_INC_FILES}
   ${PROJECT_IN_FILES}
   ${VERSION_FILE}
 )
-add_dependencies(tmc3 genversion)
+add_dependencies(tmc3core genversion)
+set_target_properties(tmc3core PROPERTIES
+  POSITION_INDEPENDENT_CODE ON
+  CXX_VISIBILITY_PRESET hidden
+  C_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
 
 find_package(Threads REQUIRED)
-target_link_libraries(tmc3 Threads::Threads)
+target_link_libraries(tmc3core Threads::Threads)
+
+add_executable (tmc3 "TMC3.cpp")
+target_link_libraries(tmc3 tmc3core)
+
+# C interface for embedding the codec (see doc/README.api.md)
+add_library (tmc3codec SHARED
+  "tmc3_api.cpp"
+  "include/tmc3_api.h"
+)
+target_include_directories(tmc3codec PUBLIC
+  "${CMAKE_CURRENT_SOURCE_DIR}/include"
+)
+target_compile_definitions(tmc3codec PRIVATE TMC3_API_BUILD)
+set_target_properties(tmc3codec PROPERTIES
+  CXX_VISIBILITY_PRESET hidden
+  VISIBILITY_INLINES_HIDDEN ON
+)
+target_link_libraries(tmc3codec tmc3core)
+
+# Test driver of the C interface (see tools/tmc3_api_test.c)
+add_executable (tmc3_api_test EXCLUDE_FROM_ALL "../tools/tmc3_api_test.c")
+target_link_libraries(tmc3_api_test tmc3codec)
 
 add_executable (ply-merge EXCLUDE_FROM_ALL
   "../tools/ply-merge.cpp"
@@ -223,3 +259,9 @@ add_executable (ply-merge EXCLUDE_FROM_ALL
 add_dependencies(ply-merge genversion)
 
 install (TARGETS tmc3 DESTINATION bin)
+install (TARGETS tmc3codec
+  RUNTIME DESTINATION bin
+  LIBRARY DESTINATION lib
+  ARCHIVE DESTINATION lib
+)
+install (FILES "include/tmc3_api.h" DESTINATION include)

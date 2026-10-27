@@ -82,6 +82,27 @@ namespace {
       size = limit.rlim_cur;
     return size;
   }
+
+  //--------------------------------------------------------------------------
+  // The stack size of the calling thread, or 0 if unknown
+
+  size_t
+  currentStackSize()
+  {
+#  if defined(__APPLE__)
+    return pthread_get_stacksize_np(pthread_self());
+#  elif defined(__linux__)
+    size_t size = 0;
+    pthread_attr_t attr;
+    if (!pthread_getattr_np(pthread_self(), &attr)) {
+      pthread_attr_getstacksize(&attr, &size);
+      pthread_attr_destroy(&attr);
+    }
+    return size;
+#  else
+    return 0;
+#  endif
+  }
 #endif
 
   //--------------------------------------------------------------------------
@@ -94,6 +115,8 @@ namespace {
 
     void resize(int numWorkers)
     {
+      // NB: waits for a running job; jobs submitted meanwhile run inline
+      std::lock_guard<std::mutex> runLock(_runMutex);
       {
         std::lock_guard<std::mutex> lock(_mutex);
         _stop = true;
@@ -243,7 +266,7 @@ namespace {
 
   //--------------------------------------------------------------------------
 
-  int gNumThreads = 1;
+  std::atomic<int> gNumThreads{1};
 
   ThreadPool&
   pool()
@@ -301,6 +324,53 @@ parallelInvoke(const std::function<void()>& a, const std::function<void()>& b)
     for (int64_t i = begin; i < end; i++)
       (i ? b : a)();
   });
+}
+
+//----------------------------------------------------------------------------
+
+void
+runWithCodingStack(const std::function<void()>& fn)
+{
+#if defined(PCC_POSIX_THREADS)
+  const size_t stackSize = workerStackSize();
+  const size_t current = currentStackSize();
+  if (!current || current >= stackSize) {
+    fn();
+    return;
+  }
+
+  struct Call {
+    const std::function<void()>* fn;
+    std::exception_ptr error;
+  } call{&fn, nullptr};
+
+  pthread_attr_t attr;
+  pthread_attr_init(&attr);
+  pthread_attr_setstacksize(&attr, stackSize);
+  pthread_t thread;
+  int err = pthread_create(
+    &thread, &attr,
+    [](void* arg) -> void* {
+      auto* call = static_cast<Call*>(arg);
+      try {
+        (*call->fn)();
+      }
+      catch (...) {
+        call->error = std::current_exception();
+      }
+      return nullptr;
+    },
+    &call);
+  pthread_attr_destroy(&attr);
+  if (err)
+    throw std::system_error(err, std::generic_category(), "pthread_create");
+
+  pthread_join(thread, nullptr);
+  if (call.error)
+    std::rethrow_exception(call.error);
+#else
+  fn();
+#endif
 }
 
 //============================================================================

@@ -1069,7 +1069,7 @@ recolour(
       desc, cfg, source, sourceToTargetScaleFactor, tgtToSrcOffset, *target);
 
     if (!ok) {
-      std::cout << "Error: can't transfer colors!" << std::endl;
+      codingLog() << "Error: can't transfer colors!" << std::endl;
       return -1;
     }
   }
@@ -1079,7 +1079,7 @@ recolour(
       desc, cfg, source, sourceToTargetScaleFactor, tgtToSrcOffset, *target);
 
     if (!ok) {
-      std::cout << "Error: can't transfer reflectance!" << std::endl;
+      codingLog() << "Error: can't transfer reflectance!" << std::endl;
       return -1;
     }
   }
