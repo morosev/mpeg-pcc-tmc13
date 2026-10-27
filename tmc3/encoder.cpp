@@ -116,6 +116,14 @@ PCCTMC3Encoder3::compress(
 
     _srcToCodingScale = params->codedGeomScale;
 
+    // Note whether the bounding box size is defined
+    // todo(df): set upper limit using level
+    // NB: before the box is derived from it below: a manual box (autoSeqBbox=0)
+    // without seqSizeWhd otherwise has its maximum below its minimum.
+    bool bboxSizeDefined = params->sps.seqBoundingBoxSize > 0;
+    if (!bboxSizeDefined)
+      params->sps.seqBoundingBoxSize = (1 << 21) - 1;
+
     // Determine input bounding box (for SPS metadata) if not manually set
     Box3<int> bbox;
     if (params->autoSeqBbox)
@@ -124,12 +132,6 @@ PCCTMC3Encoder3::compress(
       bbox.min = params->sps.seqBoundingBoxOrigin;
       bbox.max = bbox.min + params->sps.seqBoundingBoxSize - 1;
     }
-
-    // Note whether the bounding box size is defined
-    // todo(df): set upper limit using level
-    bool bboxSizeDefined = params->sps.seqBoundingBoxSize > 0;
-    if (!bboxSizeDefined)
-      params->sps.seqBoundingBoxSize = (1 << 21) - 1;
 
     // Then scale the bounding box to match the reconstructed output
     for (int k = 0; k < 3; k++) {
