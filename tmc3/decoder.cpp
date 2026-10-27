@@ -137,7 +137,11 @@ PCCTMC3Decoder3::dectectFrameBoundary(const PayloadBuffer* buf)
   auto bdry = _frameCtr.isDifferentFrame(frameCtrLsb, _sps->frame_ctr_bits);
   _frameCtr.update(frameCtrLsb, _sps->frame_ctr_bits);
 
-  return bdry;
+  // A frame completed by endFrame() is over, so these data units start the
+  // next one even with the same frame counter: eg, frames of several streams
+  // interleaved, each counting from zero.  Without this, they were appended
+  // to the frame already output, which was never output again.
+  return bdry || _frameEnded;
 }
 
 //============================================================================
@@ -510,7 +514,9 @@ PCCTMC3Decoder3::peekFrameBoundary(const PayloadBuffer& buf)
 {
   activateParameterSets(parseGbhIds(buf));
   auto gbh = parseGbh(*_sps, *_gps, buf, nullptr, nullptr);
-  return _frameCtr.isDifferentFrame(gbh.frame_ctr_lsb, _sps->frame_ctr_bits);
+  // as dectectFrameBoundary(): a frame completed by endFrame() is over
+  return _frameEnded
+    || _frameCtr.isDifferentFrame(gbh.frame_ctr_lsb, _sps->frame_ctr_bits);
 }
 
 //--------------------------------------------------------------------------

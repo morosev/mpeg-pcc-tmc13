@@ -198,6 +198,13 @@ tmc3_decoder_flush(dec);              /* end of stream */
   `tmc3_encoder_encode`, `tmc3_decoder_end_frame` outputs the frame
   immediately.  The decoded frames are identical either way.  With
   bi-prediction it has no effect, since frames are output in display order.
+- **After `tmc3_decoder_end_frame`, the next data starts a new frame,**
+  whatever its frame counter.  The decoder otherwise recognises a new frame
+  only by a change of the counter, so frames of several streams pushed in
+  turn, each counting from zero, were taken as one frame.  With frames coded
+  on their own (no inter prediction, `randomAccessPeriod=1`), one decoder
+  then takes the frames of several encoders interleaved, and any frame of a
+  stream as its first.
 - `tmc3_decoder_flush` ends the stream; data pushed afterwards is rejected.
 - The decoder is the reference decoder: it is not hardened against
   malformed streams.
