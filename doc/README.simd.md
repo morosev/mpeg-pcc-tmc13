@@ -2,8 +2,8 @@ SIMD optimisation of TMC13 (ARM NEON, Intel/AMD x86)
 =====================================================
 
 This document records the analysis of TMC13 (`tmc3`) for SIMD
-optimisation, the work done so far for ARM NEON, and the status and plan
-for Intel/AMD x86 (SSE/AVX2).
+optimisation and the work done for ARM NEON and Intel/AMD x86 (SSE4.1 and
+AVX2).
 
 The goal is real-time coding of spinning lidar at 10 Hz: 100 ms per frame
 for encoding and for decoding, measured as end-to-end wall-clock time
@@ -84,12 +84,46 @@ The lack of a 64-bit lane multiply below AVX-512 is why the RAHT transform
 its operands can be shown to fit 32 bits.
 
 
+Instruction set selection
+-------------------------
+
+`tmc3/simd.h` selects the instruction set used by every SIMD kernel, so
+that the kernels test one set of macros:
+
+| Macro | Selected when | Lanes (32-bit) |
+|---|---|---|
+| `PCC_SIMD_NEON` | AArch64 (`__aarch64__` with `__ARM_NEON`, or MSVC `_M_ARM64`) | 4 |
+| `PCC_SIMD_AVX2` (with `PCC_SIMD_SSE41`) | `__AVX2__`, eg. `-mavx2`, MSVC `/arch:AVX2` | 8, then 4 for the remainder |
+| `PCC_SIMD_SSE41` | `__SSE4_1__`, eg. `-msse4.1`, or `PCC_ENABLE_SSE41` (for MSVC) | 4 |
+| none (scalar) | otherwise, or when `PCC_DISABLE_SIMD` is defined | |
+
+`PCC_SIMD` is defined when any SIMD instruction set is selected.  Every
+kernel has a scalar path that produces identical results, and all
+choices produce identical bitstreams and reconstructions.
+
+With CMake, the `TMC3_SIMD` cache variable sets the compiler options:
+
+| `TMC3_SIMD` | Effect |
+|---|---|
+| `auto` (default) | NEON on AArch64; SSE4.1 on x86 (`-msse4.1`, or `PCC_ENABLE_SSE41` with MSVC); otherwise scalar |
+| `none` | Scalar code only (`PCC_DISABLE_SIMD`) |
+| `sse4.1` | x86 SSE4.1 |
+| `avx2` | x86 AVX2 (`-mavx2`, or `/arch:AVX2` with MSVC) |
+
+For example: `cmake -DCMAKE_BUILD_TYPE=Release -DTMC3_SIMD=avx2 ..`
+
+Notes:
+
+- The `auto` default means x86 builds require SSE4.1 (Intel since 2008,
+  AMD since 2011).  Use `TMC3_SIMD=none` for older processors.
+- Apple clang's default x86-64 target already includes SSE4.1, so x86
+  macOS builds use the SSE4.1 kernels even without `-msse4.1`.
+- NEON is limited to AArch64: the kernels use AArch64-only instructions
+  such as `vminvq_s32` and `vmull_high_u32`.
+
+
 Work done (ARM NEON)
 --------------------
-
-All SIMD code is guarded by `#if defined(__ARM_NEON)` and has a scalar
-path that produces identical results, so other targets build and behave
-as before.
 
 ### LoD nearest neighbour bucket scans (commit 9324a7c)
 
@@ -187,7 +221,7 @@ Each change was checked with:
 - Byte-identical bitstreams and decoded frames against the original
   build, for four lidar configurations (predgeom/octree geometry with
   predicting/lifting transforms), with both a NEON build and a scalar
-  fallback build (`-U__ARM_NEON`).
+  build (`PCC_DISABLE_SIMD`).
 - Additional configurations: `predictionWithDistributionEnabled=0`, and
   dense colour content with lifting and predicting transforms.
 - Randomised NEON versus scalar comparisons of `CartesianToSpherical`
@@ -205,48 +239,82 @@ arithmetic coder functions directly, and keeping LoD search buffers
 between calls.
 
 
-Intel/AMD (x86) status
-----------------------
+Work done (Intel/AMD x86)
+-------------------------
 
-No x86 SIMD paths exist yet.  On x86 the scalar paths are used, with
-these consequences:
+The three NEON kernels have SSE4.1 and AVX2 forms with the same exactness
+arguments.  The scalar optimisations of commit 1b07bd5 (bit-cost table,
+spherical refinement, allocation, ply reader) apply on every target.
 
-- Output is identical to the original software.
-- The table lookup, spherical refinement, allocation and ply reader
-  changes are scalar and benefit x86 as well.
-- The restructured LoD scan loops are 3-5% slower than the original code
-  when the scalar path is used (measured on ARM with `-U__ARM_NEON`),
-  because the bulk distance and bitmask work is done without SIMD.
+### LoD bucket scans (`tmc3/lod_scan_simd.h`)
 
-### Porting plan
+- `lodBoxScan` and `lodScanCandidates` process eight entries at a time
+  with AVX2, then four with SSE4.1 (or NEON), then a scalar tail.
+- Distances use `_mm_sub_epi32`, `_mm_abs_epi32` (`_mm_max_epi32` for the
+  boxes) and `_mm_add_epi32`.  Comparison results are packed with
+  `_mm_movemask_ps` / `_mm256_movemask_ps`, giving the same mask layout as
+  on NEON (bit `i` is entry `i`), so the scalar visiting code and its
+  exactness argument are unchanged.
+- `lodPopBit` uses `__builtin_ctz`/`__builtin_clz`, or
+  `_BitScanForward`/`_BitScanReverse` with MSVC.
 
-The NEON kernels map onto SSE4.1 (four 32-bit lanes) and AVX2 (eight),
-keeping the same exactness arguments:
+### Laser searches (`CartesianToSpherical`, `findLaserPrecise`)
 
-- `lodBoxScan`, `lodScanCandidates`: `_mm_sub_epi32`, `_mm_abs_epi32`,
-  `_mm_max_epi32`, `_mm_add_epi32`; comparison masks packed with
-  `_mm_movemask_ps(_mm_castsi128_ps(...))` (four bits per vector, or
-  eight with `_mm256_movemask_ps`).  With AVX2, one 32-entry run is four
-  vectors.
-- Laser searches: the 32x32 to 64-bit products need `_mm_mul_epu32`,
-  which multiplies only the even elements, so two multiplies plus
-  shuffles produce four lanes; the shift and narrowing are done with
-  `_mm_srli_epi64` and a shuffle.  The first minimum is found with a
-  `_mm_min_epi32` reduction followed by a scalar scan, as on ARM.
-- `lodPopBit` already supports MSVC through `_BitScanForward` and
-  `_BitScanReverse`, but that branch has not been compiled yet.
+- The NEON widening multiply and (rounding) narrowing shift are done by
+  `simdMulShiftLo` (`tmc3/simd.h`): `_mm_mul_epu32` multiplies only the
+  even lanes, so the odd lanes are shifted down and multiplied separately;
+  each 64-bit product has the rounding constant added and is shifted with
+  `_mm_srl_epi64`, and the two halves are recombined with
+  `_mm_blend_epi16` (`_mm256_blend_epi32` with AVX2).  The result is the
+  low 32 bits of each shifted product, as with `vrshrn_n_u64` /
+  `vshrn_n_u64`.
+- The remaining steps are 32-bit (`_mm_xor_si128`, `_mm_srai_epi32`,
+  `_mm_abs_epi32`, `_mm_max_epi32`); the first laser with the minimum
+  error is found with a `_mm_min_epi32` reduction (`simdMinLane`)
+  followed by a scalar scan, as on ARM.
+- The `CartesianToSpherical` laser tables are padded to a multiple of
+  eight lanes, so that the AVX2 loop has no tail; padding lanes are raised
+  to `INT32_MAX` and never attain the minimum.
 
-Build considerations: SSE4.1 and AVX2 are not part of the x86-64
-baseline, so either build with `-msse4.1`/`-mavx2` (or MSVC
-`/arch:AVX2`), or add runtime dispatch.  The same bit-exact verification
-(NEON vs scalar becomes SSE/AVX2 vs scalar) applies.
+### Verification
+
+The x86 builds were cross-compiled on macOS (`clang -arch x86_64`, with
+`-DPCC_DISABLE_SIMD`, `-msse4.1` and `-mavx2`) and run under Rosetta 2:
+
+- The original source built for x86 produces bitstreams identical to the
+  ARM build for the four lidar configurations.
+- The scalar, SSE4.1 and AVX2 builds produce byte-identical bitstreams
+  and decoded frames (30/30) to the original x86 build, for the four
+  lidar configurations (predgeom/octree geometry with predicting/lifting
+  transforms).
+- The randomised comparisons of `CartesianToSpherical` and
+  `findLaserPrecise` give identical results for every ARM and x86
+  variant.
+- A stress test of `findLaserPrecise` with 1M points near the lidar axis
+  (where `theta32` overflows 32 bits) gives identical results for every
+  variant and agrees with the original scalar search.
+
+The randomised test found one bug during the port: the scalar tail of
+the SIMD `findLaserPrecise` (for laser counts that are not a multiple of
+the vector width) reused the expression `std::abs(theta32 - theta)`.  For
+points very close to the axis the subtraction overflows, which is
+undefined behaviour, and once inlined the compiler evaluated it
+differently from the vector lanes.  The tail now uses explicit 32-bit
+wrapping arithmetic, which is what the vector lanes compute and what the
+original scalar search compiles to on ARM and x86.
+
+No x86 performance figures are given: the x86 builds have only been run
+under Rosetta 2, whose timings do not represent Intel or AMD processors.
 
 
 Remaining work
 --------------
 
-- Port the kernels to SSE4.1/AVX2, and remove the scalar LoD scan
-  overhead.
+- Benchmark the x86 kernels on Intel and AMD processors, and measure
+  the overhead of the restructured LoD scans when SIMD is disabled (3-5%
+  on ARM).
+- Build and test with MSVC (x64 and ARM64) and with the CMake
+  `TMC3_SIMD` option, which have not been tested yet.
 - Confirm all results on real Ford sequences: the measurements so far use
   synthetic frames (about 143k points, more than typical Ford frames).
 - More margin for predgeom + lifting encode (98.7 ms): the remaining time

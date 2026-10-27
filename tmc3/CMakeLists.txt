@@ -11,6 +11,41 @@ include(CheckSymbolExists)
 check_symbol_exists(getrusage sys/resource.h HAVE_GETRUSAGE)
 
 ##
+# Instruction set used by the SIMD kernels (see doc/README.simd.md).
+# All choices produce identical output.
+#  - auto:   NEON on AArch64, SSE4.1 on x86, otherwise none
+#  - none:   scalar code only
+#  - sse4.1: x86 SSE4.1
+#  - avx2:   x86 AVX2
+set(TMC3_SIMD "auto" CACHE STRING "SIMD instruction set: auto, none, sse4.1, avx2")
+set_property(CACHE TMC3_SIMD PROPERTY STRINGS auto none sse4.1 avx2)
+
+if (CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64|x86|i[3-6]86)$")
+  set(TMC3_TARGET_X86 TRUE)
+endif()
+
+if (TMC3_SIMD STREQUAL "none")
+  add_definitions(-DPCC_DISABLE_SIMD)
+elseif (TMC3_SIMD STREQUAL "avx2")
+  if (MSVC)
+    add_compile_options(/arch:AVX2)
+  else()
+    add_compile_options(-mavx2)
+  endif()
+elseif (TMC3_SIMD STREQUAL "sse4.1"
+        OR (TMC3_SIMD STREQUAL "auto" AND TMC3_TARGET_X86))
+  # NB: MSVC has no option to select SSE4.1; the intrinsics are always
+  #     available, so the kernels are enabled explicitly.
+  if (MSVC)
+    add_definitions(-DPCC_ENABLE_SSE41)
+  else()
+    add_compile_options(-msse4.1)
+  endif()
+elseif (NOT TMC3_SIMD STREQUAL "auto")
+  message(FATAL_ERROR "Unknown TMC3_SIMD value: ${TMC3_SIMD}")
+endif()
+
+##
 # Determine the software version from VCS
 # Fallback to descriptive version if VCS unavailable
 #  NB: the "unconfirmed-" part refers to this being a fallback option
@@ -105,6 +140,7 @@ file(GLOB PROJECT_INC_FILES
   "pointset_processing.h"
   "quantization.h"
   "ringbuf.h"
+  "simd.h"
   "tables.h"
   "version.h"
   "../dependencies/nanoflann/*.hpp"

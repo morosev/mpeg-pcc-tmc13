@@ -43,9 +43,8 @@
 #include <limits>
 #include <vector>
 
-#if defined(__ARM_NEON)
-#  include <arm_neon.h>
-#endif
+#include "simd.h"
+
 #if defined(_MSC_VER)
 #  include <intrin.h>
 #endif
@@ -59,7 +58,7 @@ namespace pcc {
 // are computed in bulk; the (order dependent) list updates remain scalar so
 // that the result is identical to a purely scalar search.
 
-#if defined(__ARM_NEON)
+#if defined(PCC_SIMD)
 constexpr bool kLodScanSimd = true;
 #else
 constexpr bool kLodScanSimd = false;
@@ -148,7 +147,7 @@ lodForEachBit(uint32_t mask, F f)
     f(lodPopBit<Reverse>(mask));
 }
 
-#if defined(__ARM_NEON)
+#if defined(PCC_SIMD_NEON)
 //----------------------------------------------------------------------------
 // Pack the four lane flags of m into the low bits of the result.
 
@@ -176,29 +175,89 @@ lodBoxScan(
 {
   uint32_t mask = 0;
   int32_t b = b0;
-#if defined(__ARM_NEON)
+#if defined(PCC_SIMD)
   // NB: a limit beyond the int32 range keeps every box
   const bool keepAll = limit > std::numeric_limits<int32_t>::max();
-  const int32x4_t lim = vdupq_n_s32(keepAll ? 0 : int32_t(limit));
-  const int32x4_t px = vdupq_n_s32(p[0]);
-  const int32x4_t py = vdupq_n_s32(p[1]);
-  const int32x4_t pz = vdupq_n_s32(p[2]);
-  const int32x4_t zero = vdupq_n_s32(0);
-  for (; b + 3 <= b1; b += 4) {
-    // per axis: max(max(min - p, 0), p - max), as Box3::getDist1
-    int32x4_t dx = vmaxq_s32(
-      vmaxq_s32(vsubq_s32(vld1q_s32(&bx.minX[b]), px), zero),
-      vsubq_s32(px, vld1q_s32(&bx.maxX[b])));
-    int32x4_t dy = vmaxq_s32(
-      vmaxq_s32(vsubq_s32(vld1q_s32(&bx.minY[b]), py), zero),
-      vsubq_s32(py, vld1q_s32(&bx.maxY[b])));
-    int32x4_t dz = vmaxq_s32(
-      vmaxq_s32(vsubq_s32(vld1q_s32(&bx.minZ[b]), pz), zero),
-      vsubq_s32(pz, vld1q_s32(&bx.maxZ[b])));
-    int32x4_t d = vaddq_s32(vaddq_s32(dx, dy), dz);
-    vst1q_s32(dist + (b - b0), d);
-    uint32_t bits = keepAll ? 0xf : lodLaneBits(vcltq_s32(d, lim));
-    mask |= bits << (b - b0);
+  const int32_t lim32 = keepAll ? 0 : int32_t(limit);
+#endif
+
+  // per axis: max(max(min - p, 0), p - max), as Box3::getDist1
+#if defined(PCC_SIMD_AVX2)
+  {
+    const __m256i lim = _mm256_set1_epi32(lim32);
+    const __m256i px = _mm256_set1_epi32(p[0]);
+    const __m256i py = _mm256_set1_epi32(p[1]);
+    const __m256i pz = _mm256_set1_epi32(p[2]);
+    const __m256i zero = _mm256_setzero_si256();
+    auto load = [](const std::vector<int32_t>& v, int32_t i) {
+      return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&v[i]));
+    };
+    for (; b + 7 <= b1; b += 8) {
+      __m256i dx = _mm256_max_epi32(
+        _mm256_max_epi32(_mm256_sub_epi32(load(bx.minX, b), px), zero),
+        _mm256_sub_epi32(px, load(bx.maxX, b)));
+      __m256i dy = _mm256_max_epi32(
+        _mm256_max_epi32(_mm256_sub_epi32(load(bx.minY, b), py), zero),
+        _mm256_sub_epi32(py, load(bx.maxY, b)));
+      __m256i dz = _mm256_max_epi32(
+        _mm256_max_epi32(_mm256_sub_epi32(load(bx.minZ, b), pz), zero),
+        _mm256_sub_epi32(pz, load(bx.maxZ, b)));
+      __m256i d = _mm256_add_epi32(_mm256_add_epi32(dx, dy), dz);
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(dist + (b - b0)), d);
+      uint32_t bits =
+        keepAll ? 0xff : simdLaneBits(_mm256_cmpgt_epi32(lim, d));
+      mask |= bits << (b - b0);
+    }
+  }
+#endif
+#if defined(PCC_SIMD_NEON)
+  {
+    const int32x4_t lim = vdupq_n_s32(lim32);
+    const int32x4_t px = vdupq_n_s32(p[0]);
+    const int32x4_t py = vdupq_n_s32(p[1]);
+    const int32x4_t pz = vdupq_n_s32(p[2]);
+    const int32x4_t zero = vdupq_n_s32(0);
+    for (; b + 3 <= b1; b += 4) {
+      int32x4_t dx = vmaxq_s32(
+        vmaxq_s32(vsubq_s32(vld1q_s32(&bx.minX[b]), px), zero),
+        vsubq_s32(px, vld1q_s32(&bx.maxX[b])));
+      int32x4_t dy = vmaxq_s32(
+        vmaxq_s32(vsubq_s32(vld1q_s32(&bx.minY[b]), py), zero),
+        vsubq_s32(py, vld1q_s32(&bx.maxY[b])));
+      int32x4_t dz = vmaxq_s32(
+        vmaxq_s32(vsubq_s32(vld1q_s32(&bx.minZ[b]), pz), zero),
+        vsubq_s32(pz, vld1q_s32(&bx.maxZ[b])));
+      int32x4_t d = vaddq_s32(vaddq_s32(dx, dy), dz);
+      vst1q_s32(dist + (b - b0), d);
+      uint32_t bits = keepAll ? 0xf : lodLaneBits(vcltq_s32(d, lim));
+      mask |= bits << (b - b0);
+    }
+  }
+#elif defined(PCC_SIMD_SSE41)
+  {
+    const __m128i lim = _mm_set1_epi32(lim32);
+    const __m128i px = _mm_set1_epi32(p[0]);
+    const __m128i py = _mm_set1_epi32(p[1]);
+    const __m128i pz = _mm_set1_epi32(p[2]);
+    const __m128i zero = _mm_setzero_si128();
+    auto load = [](const std::vector<int32_t>& v, int32_t i) {
+      return _mm_loadu_si128(reinterpret_cast<const __m128i*>(&v[i]));
+    };
+    for (; b + 3 <= b1; b += 4) {
+      __m128i dx = _mm_max_epi32(
+        _mm_max_epi32(_mm_sub_epi32(load(bx.minX, b), px), zero),
+        _mm_sub_epi32(px, load(bx.maxX, b)));
+      __m128i dy = _mm_max_epi32(
+        _mm_max_epi32(_mm_sub_epi32(load(bx.minY, b), py), zero),
+        _mm_sub_epi32(py, load(bx.maxY, b)));
+      __m128i dz = _mm_max_epi32(
+        _mm_max_epi32(_mm_sub_epi32(load(bx.minZ, b), pz), zero),
+        _mm_sub_epi32(pz, load(bx.maxZ, b)));
+      __m128i d = _mm_add_epi32(_mm_add_epi32(dx, dy), dz);
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(dist + (b - b0)), d);
+      uint32_t bits = keepAll ? 0xf : simdLaneBits(_mm_cmplt_epi32(d, lim));
+      mask |= bits << (b - b0);
+    }
   }
 #endif
   for (; b <= b1; ++b) {
@@ -232,7 +291,7 @@ lodScanCandidates(
   int64_t threshold,
   Visit visit)
 {
-#if defined(__ARM_NEON)
+#if defined(PCC_SIMD)
   if (h1 < h0)
     return;
 
@@ -243,20 +302,60 @@ lodScanCandidates(
     return;
   }
 
-  const int32x4_t thr = vdupq_n_s32(int32_t(threshold));
-  const int32x4_t px = vdupq_n_s32(p[0]);
-  const int32x4_t py = vdupq_n_s32(p[1]);
-  const int32x4_t pz = vdupq_n_s32(p[2]);
-
+  // |dx| + |dy| + |dz| <= threshold
+  const int32_t thr32 = int32_t(threshold);
   uint32_t mask = 0;
   int32_t h = h0;
-  for (; h + 3 <= h1; h += 4) {
-    // |dx| + |dy| + |dz| <= threshold
-    int32x4_t d = vabsq_s32(vsubq_s32(px, vld1q_s32(&c.x[h])));
-    d = vaddq_s32(d, vabsq_s32(vsubq_s32(py, vld1q_s32(&c.y[h]))));
-    d = vaddq_s32(d, vabsq_s32(vsubq_s32(pz, vld1q_s32(&c.z[h]))));
-    mask |= lodLaneBits(vcleq_s32(d, thr)) << (h - h0);
+
+#  if defined(PCC_SIMD_AVX2)
+  {
+    const __m256i thr = _mm256_set1_epi32(thr32);
+    const __m256i px = _mm256_set1_epi32(p[0]);
+    const __m256i py = _mm256_set1_epi32(p[1]);
+    const __m256i pz = _mm256_set1_epi32(p[2]);
+    auto absDiff = [](__m256i a, const std::vector<int32_t>& v, int32_t i) {
+      return _mm256_abs_epi32(_mm256_sub_epi32(
+        a, _mm256_loadu_si256(reinterpret_cast<const __m256i*>(&v[i]))));
+    };
+    for (; h + 7 <= h1; h += 8) {
+      __m256i d = absDiff(px, c.x, h);
+      d = _mm256_add_epi32(d, absDiff(py, c.y, h));
+      d = _mm256_add_epi32(d, absDiff(pz, c.z, h));
+      mask |= (~simdLaneBits(_mm256_cmpgt_epi32(d, thr)) & 0xff) << (h - h0);
+    }
   }
+#  endif
+#  if defined(PCC_SIMD_NEON)
+  {
+    const int32x4_t thr = vdupq_n_s32(thr32);
+    const int32x4_t px = vdupq_n_s32(p[0]);
+    const int32x4_t py = vdupq_n_s32(p[1]);
+    const int32x4_t pz = vdupq_n_s32(p[2]);
+    for (; h + 3 <= h1; h += 4) {
+      int32x4_t d = vabsq_s32(vsubq_s32(px, vld1q_s32(&c.x[h])));
+      d = vaddq_s32(d, vabsq_s32(vsubq_s32(py, vld1q_s32(&c.y[h]))));
+      d = vaddq_s32(d, vabsq_s32(vsubq_s32(pz, vld1q_s32(&c.z[h]))));
+      mask |= lodLaneBits(vcleq_s32(d, thr)) << (h - h0);
+    }
+  }
+#  elif defined(PCC_SIMD_SSE41)
+  {
+    const __m128i thr = _mm_set1_epi32(thr32);
+    const __m128i px = _mm_set1_epi32(p[0]);
+    const __m128i py = _mm_set1_epi32(p[1]);
+    const __m128i pz = _mm_set1_epi32(p[2]);
+    auto absDiff = [](__m128i a, const std::vector<int32_t>& v, int32_t i) {
+      return _mm_abs_epi32(_mm_sub_epi32(
+        a, _mm_loadu_si128(reinterpret_cast<const __m128i*>(&v[i]))));
+    };
+    for (; h + 3 <= h1; h += 4) {
+      __m128i d = absDiff(px, c.x, h);
+      d = _mm_add_epi32(d, absDiff(py, c.y, h));
+      d = _mm_add_epi32(d, absDiff(pz, c.z, h));
+      mask |= (~simdLaneBits(_mm_cmpgt_epi32(d, thr)) & 0xf) << (h - h0);
+    }
+  }
+#  endif
   for (; h <= h1; ++h)
     mask |= uint32_t(1) << (h - h0);
 

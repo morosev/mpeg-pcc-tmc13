@@ -48,12 +48,9 @@
 #include <string>
 #include <vector>
 
-#if defined(__ARM_NEON)
-#  include <arm_neon.h>
-#endif
-
 #include "PCCMath.h"
 #include "PCCMisc.h"
+#include "simd.h"
 
 namespace pcc {
 
@@ -608,44 +605,99 @@ swap(PCCPointSet3& a, PCCPointSet3& b)
 
 //============================================================================
 
-#if defined(__ARM_NEON)
-// NEON form of the laser search in findLaserPrecise, for rInv < 2^32.
+#if defined(PCC_SIMD)
+// SIMD form of the laser search in findLaserPrecise, for rInv < 2^32.
 // NB: (|zS3| * rInv) >> 17 is a 32x32-bit product shifted and truncated to
 //     32 bits, as is the scalar int conversion; the sign is then restored.
 
-static const int kFindLaserNeonMax = 256;
+static const int kFindLaserSimdMax = 256;
 
-static inline int findLaserPreciseNeon(
+static inline int findLaserPreciseSimd(
   int32_t z, uint32_t rInv, const int* thetaList, const int* zList,
   const int numTheta)
 {
-  int32_t dist[kFindLaserNeonMax];
-  const int32x4_t z8 = vdupq_n_s32(z << 3);
-  const uint32x4_t vrInv = vdupq_n_u32(rInv);
-  int32x4_t vmin = vdupq_n_s32(std::numeric_limits<int>::max());
-
+  int32_t dist[kFindLaserSimdMax];
+  int dBest = std::numeric_limits<int>::max();
   int l = 0;
-  for (; l + 3 < numTheta; l += 4) {
-    int32x4_t zS3 = vaddq_s32(z8, vld1q_s32(zList + l));
-    int32x4_t sign = vshrq_n_s32(zS3, 31);
-    uint32x4_t a = vreinterpretq_u32_s32(vabsq_s32(zS3));
-    uint32x2_t lo =
-      vshrn_n_u64(vmull_u32(vget_low_u32(a), vget_low_u32(vrInv)), 14 + 3);
-    uint32x4_t q = vshrn_high_n_u64(lo, vmull_high_u32(a, vrInv), 14 + 3);
-    int32x4_t theta32 =
-      vsubq_s32(veorq_s32(vreinterpretq_s32_u32(q), sign), sign);
-    int32x4_t d = vabsq_s32(vsubq_s32(theta32, vld1q_s32(thetaList + l)));
-    vst1q_s32(dist + l, d);
-    vmin = vminq_s32(vmin, d);
-  }
 
-  int dBest = vminvq_s32(vmin);
+#  if defined(PCC_SIMD_NEON)
+  {
+    const int32x4_t z8 = vdupq_n_s32(z << 3);
+    const uint32x4_t vrInv = vdupq_n_u32(rInv);
+    int32x4_t vmin = vdupq_n_s32(dBest);
+    for (; l + 3 < numTheta; l += 4) {
+      int32x4_t zS3 = vaddq_s32(z8, vld1q_s32(zList + l));
+      int32x4_t sign = vshrq_n_s32(zS3, 31);
+      uint32x4_t a = vreinterpretq_u32_s32(vabsq_s32(zS3));
+      uint32x2_t lo =
+        vshrn_n_u64(vmull_u32(vget_low_u32(a), vget_low_u32(vrInv)), 14 + 3);
+      uint32x4_t q = vshrn_high_n_u64(lo, vmull_high_u32(a, vrInv), 14 + 3);
+      int32x4_t theta32 =
+        vsubq_s32(veorq_s32(vreinterpretq_s32_u32(q), sign), sign);
+      int32x4_t d = vabsq_s32(vsubq_s32(theta32, vld1q_s32(thetaList + l)));
+      vst1q_s32(dist + l, d);
+      vmin = vminq_s32(vmin, d);
+    }
+    dBest = vminvq_s32(vmin);
+  }
+#  endif
+#  if defined(PCC_SIMD_AVX2)
+  {
+    const __m256i z8 = _mm256_set1_epi32(z << 3);
+    const __m256i vrInv = _mm256_set1_epi32(int32_t(rInv));
+    const __m256i zero = _mm256_setzero_si256();
+    __m256i vmin = _mm256_set1_epi32(dBest);
+    auto load = [](const int* v) {
+      return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(v));
+    };
+    for (; l + 7 < numTheta; l += 8) {
+      __m256i zS3 = _mm256_add_epi32(z8, load(zList + l));
+      __m256i sign = _mm256_srai_epi32(zS3, 31);
+      __m256i a = _mm256_abs_epi32(zS3);
+      __m256i q = simdMulShiftLo(a, vrInv, zero, 14 + 3);
+      __m256i theta32 = _mm256_sub_epi32(_mm256_xor_si256(q, sign), sign);
+      __m256i d =
+        _mm256_abs_epi32(_mm256_sub_epi32(theta32, load(thetaList + l)));
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(dist + l), d);
+      vmin = _mm256_min_epi32(vmin, d);
+    }
+    dBest = simdMinLane(vmin);
+  }
+#  endif
+#  if defined(PCC_SIMD_SSE41)
+  {
+    const __m128i z8 = _mm_set1_epi32(z << 3);
+    const __m128i vrInv = _mm_set1_epi32(int32_t(rInv));
+    const __m128i zero = _mm_setzero_si128();
+    __m128i vmin = _mm_set1_epi32(dBest);
+    auto load = [](const int* v) {
+      return _mm_loadu_si128(reinterpret_cast<const __m128i*>(v));
+    };
+    for (; l + 3 < numTheta; l += 4) {
+      __m128i zS3 = _mm_add_epi32(z8, load(zList + l));
+      __m128i sign = _mm_srai_epi32(zS3, 31);
+      __m128i a = _mm_abs_epi32(zS3);
+      __m128i q = simdMulShiftLo(a, vrInv, zero, 14 + 3);
+      __m128i theta32 = _mm_sub_epi32(_mm_xor_si128(q, sign), sign);
+      __m128i d = _mm_abs_epi32(_mm_sub_epi32(theta32, load(thetaList + l)));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(dist + l), d);
+      vmin = _mm_min_epi32(vmin, d);
+    }
+    dBest = simdMinLane(vmin);
+  }
+#  endif
+
+  // NB: the remaining lasers use the 32-bit wrapping arithmetic of the
+  //     vector lanes.  For points very close to the axis, theta32 and the
+  //     difference overflow 32 bits, where the plain int expressions of the
+  //     scalar search are undefined.
   for (; l < numTheta; l++) {
-    int zS3 = (z << 3) + zList[l];
-    int theta32 =
-      zS3 >= 0 ? (zS3 * int64_t(rInv)) >> (14 + 3)
-               : -((-zS3 * int64_t(rInv)) >> (14 + 3));
-    dist[l] = std::abs(theta32 - thetaList[l]);
+    int32_t zS3 = int32_t(uint32_t(z) * 8u + uint32_t(zList[l]));
+    uint32_t a = zS3 < 0 ? 0u - uint32_t(zS3) : uint32_t(zS3);
+    uint32_t q = uint32_t((uint64_t(a) * rInv) >> (14 + 3));
+    uint32_t theta32 = zS3 < 0 ? 0u - q : q;
+    int32_t diff = int32_t(theta32 - uint32_t(thetaList[l]));
+    dist[l] = diff < 0 ? int32_t(0u - uint32_t(diff)) : diff;
     dBest = std::min(dBest, dist[l]);
   }
 
@@ -672,9 +724,9 @@ static inline int findLaserPrecise(
   int64_t yLidar = int64_t(point[1]) << 8;
   int64_t rInv = irsqrt(xLidar * xLidar + yLidar * yLidar);
 
-#if defined(__ARM_NEON)
-  if (rInv >= 0 && rInv <= UINT32_MAX && numTheta <= kFindLaserNeonMax)
-    return findLaserPreciseNeon(
+#if defined(PCC_SIMD)
+  if (rInv >= 0 && rInv <= UINT32_MAX && numTheta <= kFindLaserSimdMax)
+    return findLaserPreciseSimd(
       point[2], uint32_t(rInv), thetaList, zList, numTheta);
 #endif
 

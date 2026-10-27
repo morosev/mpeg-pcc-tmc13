@@ -39,13 +39,10 @@
 #include <cstdint>
 #include <vector>
 
-#if defined(__ARM_NEON)
-#  include <arm_neon.h>
-#endif
-
 #include "constants.h"
 #include "entropy.h"
 #include "PCCMath.h"
+#include "simd.h"
 #include "hls.h"
 #include "PCCPointSet.h"
 #include "geometry_params.h"
@@ -308,7 +305,7 @@ public:
     , tanThetaLaser(gps.angularTheta.data())
     , zLaser(gps.angularZ.data())
   {
-#if defined(__ARM_NEON)
+#if defined(PCC_SIMD)
     initLaserSearch();
 #endif
   }
@@ -365,9 +362,9 @@ private:
   // The first laser whose height at radius r0 is closest to z.
   int32_t findLaser(int64_t r0, int32_t z)
   {
-#if defined(__ARM_NEON)
+#if defined(PCC_SIMD)
     if (r0 <= laserSearchMaxR && std::abs(z) <= kLaserSearchMaxAbs)
-      return findLaserNeon(uint32_t(r0), z);
+      return findLaserSimd(uint32_t(r0), z);
 #endif
     int32_t thetaIdx = 0;
     int32_t minError = std::numeric_limits<int32_t>::max();
@@ -384,7 +381,7 @@ private:
     return thetaIdx;
   }
 
-#if defined(__ARM_NEON)
+#if defined(PCC_SIMD)
   // Bound on the magnitude of intermediate values in the 32-bit search
   static constexpr int32_t kLaserSearchMaxAbs = 1 << 28;
 
@@ -392,7 +389,8 @@ private:
   {
     // NB: the search is disabled by a negative radius limit
     laserSearchMaxR = -1;
-    const int padded = (numLasers + 3) & ~3;
+    // NB: padded for whole vectors of up to eight lanes
+    const int padded = (numLasers + 7) & ~7;
     if (!numLasers || padded > kMaxLasers)
       return;
 
@@ -420,13 +418,17 @@ private:
       : UINT32_MAX;
   }
 
-  int32_t findLaserNeon(uint32_t r0, int32_t z)
+  int32_t findLaserSimd(uint32_t r0, int32_t z)
   {
     // NB: r0 >= 0, so rounding tan * r0 * 4 / 2^17 half away from zero is
     //     sign(tan) * ((|tan| * r0 + 2^14) >> 15), a rounding narrow shift.
     //     Every subsequent value fits in 32 bits by construction.
+    //     Then z1 = divExp2RoundHalfInf(z0 - zLaser, 3) and the error is
+    //     |z1 - z|, padding lanes being raised to errFloor.
     int32_t err[kMaxLasers];
     const int padded = int(absTan.size());
+    int32_t minError;
+#  if defined(PCC_SIMD_NEON)
     const uint32x4_t vr0 = vdupq_n_u32(r0);
     const int32x4_t vz = vdupq_n_s32(z);
     int32x4_t vmin = vdupq_n_s32(std::numeric_limits<int32_t>::max());
@@ -438,7 +440,6 @@ private:
       int32x4_t s = vld1q_s32(&tanSign[idx]);
       int32x4_t z0 = vsubq_s32(veorq_s32(vreinterpretq_s32_u32(q), s), s);
 
-      // divExp2RoundHalfInf(z0 - zLaser, 3)
       int32x4_t d = vsubq_s32(z0, vld1q_s32(&zOffset[idx]));
       int32x4_t ds = vshrq_n_s32(d, 31);
       uint32x4_t a = vrshrq_n_u32(vreinterpretq_u32_s32(vabsq_s32(d)), 3);
@@ -449,9 +450,63 @@ private:
       vst1q_s32(&err[idx], e);
       vmin = vminq_s32(vmin, e);
     }
+    minError = vminvq_s32(vmin);
+#  elif defined(PCC_SIMD_AVX2)
+    const __m256i vr0 = _mm256_set1_epi32(int32_t(r0));
+    const __m256i vz = _mm256_set1_epi32(z);
+    const __m256i round = _mm256_set1_epi64x(1 << 14);
+    const __m256i four = _mm256_set1_epi32(4);
+    __m256i vmin = _mm256_set1_epi32(std::numeric_limits<int32_t>::max());
+    auto load = [](const int32_t* v) {
+      return _mm256_loadu_si256(reinterpret_cast<const __m256i*>(v));
+    };
+    for (int idx = 0; idx < padded; idx += 8) {
+      __m256i t = load(reinterpret_cast<const int32_t*>(&absTan[idx]));
+      __m256i q = simdMulShiftLo(t, vr0, round, 15);
+      __m256i s = load(&tanSign[idx]);
+      __m256i z0 = _mm256_sub_epi32(_mm256_xor_si256(q, s), s);
+
+      __m256i d = _mm256_sub_epi32(z0, load(&zOffset[idx]));
+      __m256i ds = _mm256_srai_epi32(d, 31);
+      __m256i a =
+        _mm256_srli_epi32(_mm256_add_epi32(_mm256_abs_epi32(d), four), 3);
+      __m256i z1 = _mm256_sub_epi32(_mm256_xor_si256(a, ds), ds);
+
+      __m256i e = _mm256_abs_epi32(_mm256_sub_epi32(z1, vz));
+      e = _mm256_max_epi32(e, load(&errFloor[idx]));
+      _mm256_storeu_si256(reinterpret_cast<__m256i*>(&err[idx]), e);
+      vmin = _mm256_min_epi32(vmin, e);
+    }
+    minError = simdMinLane(vmin);
+#  elif defined(PCC_SIMD_SSE41)
+    const __m128i vr0 = _mm_set1_epi32(int32_t(r0));
+    const __m128i vz = _mm_set1_epi32(z);
+    const __m128i round = _mm_set1_epi64x(1 << 14);
+    const __m128i four = _mm_set1_epi32(4);
+    __m128i vmin = _mm_set1_epi32(std::numeric_limits<int32_t>::max());
+    auto load = [](const int32_t* v) {
+      return _mm_loadu_si128(reinterpret_cast<const __m128i*>(v));
+    };
+    for (int idx = 0; idx < padded; idx += 4) {
+      __m128i t = load(reinterpret_cast<const int32_t*>(&absTan[idx]));
+      __m128i q = simdMulShiftLo(t, vr0, round, 15);
+      __m128i s = load(&tanSign[idx]);
+      __m128i z0 = _mm_sub_epi32(_mm_xor_si128(q, s), s);
+
+      __m128i d = _mm_sub_epi32(z0, load(&zOffset[idx]));
+      __m128i ds = _mm_srai_epi32(d, 31);
+      __m128i a = _mm_srli_epi32(_mm_add_epi32(_mm_abs_epi32(d), four), 3);
+      __m128i z1 = _mm_sub_epi32(_mm_xor_si128(a, ds), ds);
+
+      __m128i e = _mm_abs_epi32(_mm_sub_epi32(z1, vz));
+      e = _mm_max_epi32(e, load(&errFloor[idx]));
+      _mm_storeu_si128(reinterpret_cast<__m128i*>(&err[idx]), e);
+      vmin = _mm_min_epi32(vmin, e);
+    }
+    minError = simdMinLane(vmin);
+#  endif
 
     // the first laser attaining the minimum, as the scalar search
-    const int32_t minError = vminvq_s32(vmin);
     int idx = 0;
     while (err[idx] != minError)
       idx++;
