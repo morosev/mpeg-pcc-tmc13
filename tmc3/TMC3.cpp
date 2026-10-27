@@ -35,6 +35,7 @@
 
 #include "TMC3.h"
 
+#include <future>
 #include <memory>
 
 #include "PCCTMC3Encoder.h"
@@ -44,6 +45,7 @@
 #include "pointset_processing.h"
 #include "program_options_lite.h"
 #include "io_tlv.h"
+#include "parallel.h"
 #include "version.h"
 
 using namespace std;
@@ -78,6 +80,9 @@ struct Parameters {
 
   // output mode for ply writing (binary or ascii)
   bool outputBinaryPly;
+
+  // Number of threads used for parallel processing
+  int numThreads;
 
   // Fractional fixed-point bits retained in conformance output
   int outputFpBits;
@@ -162,6 +167,9 @@ protected:
   int compressOneFrame(Stopwatch* clock);
   int compressOneGOF(Stopwatch* clock);
 
+  // Read and prepare the input frame frameFileNum
+  bool loadInputFrame(int frameFileNum, PCCPointSet3& pointCloud);
+
   void onOutputBuffer(const PayloadBuffer& buf) override;
   void onPostRecolour(const PCCPointSet3& cloud) override;
 
@@ -183,6 +191,14 @@ private:
   // Indicates the file number of previous I/P frame
   int preIPFrame;
   bool codedGOF;
+
+  // The next input frame, read while the current frame is coded
+  struct InputPrefetch {
+    int fileNum = -1;
+    bool ok = false;
+    PCCPointSet3 cloud;
+    std::future<void> done;
+  } _prefetch;
 };
 
 //----------------------------------------------------------------------------
@@ -205,6 +221,9 @@ private:
   std::ofstream bytestreamFile;
 
   Stopwatch* clock;
+
+  // The output frame being written while the next frame is decoded
+  std::future<void> _pendingWrite;
 };
 
 //============================================================================
@@ -233,6 +252,8 @@ main(int argc, char* argv[])
               << e.val << "\"." << std::endl;
     return 1;
   }
+
+  pcc::setNumThreads(params.numThreads);
 
   // Timers to count elapsed wall/user time
   pcc::chrono::Stopwatch<std::chrono::steady_clock> clock_wall;
@@ -676,6 +697,11 @@ ParseParameters(int argc, char* argv[], Parameters& params)
   ("outputBinaryPly",
     params.outputBinaryPly, true,
     "Output ply files using binary (or ascii) format")
+
+  ("numThreads",
+    params.numThreads, 1,
+    "Number of threads used for parallel processing (1: no threads).\n"
+    "The output does not depend on the number of threads")
 
   ("outputUnitLength",
     params.outputUnitLength, 0.,
@@ -2191,20 +2217,15 @@ SequenceEncoder::compress(Stopwatch* clock)
 
 //----------------------------------------------------------------------------
 
-int
-SequenceEncoder::compressOneFrame(Stopwatch* clock)
+bool
+SequenceEncoder::loadInputFrame(int frameFileNum, PCCPointSet3& pointCloud)
 {
-  const auto frameFileNum = params->encoder.gps.biPredictionEnabledFlag
-    ? (encoder.getCurrFrameIndex() + params->firstFrameNum)
-    : frameNum;
   std::string srcName{expandNum(params->uncompressedDataPath, frameFileNum)};
-  PCCPointSet3 pointCloud;
   if (
     !ply::read(srcName, _plyAttrNames, params->inputScale, pointCloud)
-    || pointCloud.getPointCount() == 0) {
-    cout << "Error: can't open input file!" << endl;
-    return -1;
-  }
+    || pointCloud.getPointCount() == 0)
+    return false;
+
   // Some evaluations wish to scan the points in azimuth order to simulate
   // real-time acquisition (since the input has lost its original order).
   // NB: because this is trying to emulate the input order, binning is disabled
@@ -2227,6 +2248,45 @@ SequenceEncoder::compressOneFrame(Stopwatch* clock)
   if (!codeReflectance)
     pointCloud.removeReflectances();
   assert(codeReflectance == pointCloud.hasReflectances());
+
+  return true;
+}
+
+//----------------------------------------------------------------------------
+
+int
+SequenceEncoder::compressOneFrame(Stopwatch* clock)
+{
+  const auto frameFileNum = params->encoder.gps.biPredictionEnabledFlag
+    ? (encoder.getCurrFrameIndex() + params->firstFrameNum)
+    : frameNum;
+  PCCPointSet3 pointCloud;
+  bool loaded = false;
+  if (_prefetch.done.valid()) {
+    _prefetch.done.get();
+    if (_prefetch.fileNum == frameFileNum && _prefetch.ok) {
+      pointCloud.swap(_prefetch.cloud);
+      loaded = true;
+    }
+    _prefetch.cloud = PCCPointSet3();
+  }
+
+  if (!loaded && !loadInputFrame(frameFileNum, pointCloud)) {
+    cout << "Error: can't open input file!" << endl;
+    return -1;
+  }
+
+  // With several threads, read the next frame while this one is coded
+  // NB: frames are coded in file order unless bi-prediction is used
+  const int nextFileNum = frameFileNum + 1;
+  if (
+    pcc::numThreads() > 1 && !params->encoder.gps.biPredictionEnabledFlag
+    && nextFileNum < params->firstFrameNum + params->frameCount) {
+    _prefetch.fileNum = nextFileNum;
+    _prefetch.done = std::async(std::launch::async, [this, nextFileNum] {
+      _prefetch.ok = loadInputFrame(nextFileNum, _prefetch.cloud);
+    });
+  }
 
   clock->start();
 
@@ -2420,6 +2480,9 @@ SequenceDecoder::decompress(Stopwatch* clock)
       break;
   }
 
+  if (_pendingWrite.valid())
+    _pendingWrite.get();
+
   fin.clear();
   fin.seekg(0, ios_base::end);
   std::cout << "Total bitstream size " << fin.tellg() << " B" << std::endl;
@@ -2434,6 +2497,20 @@ SequenceDecoder::decompress(Stopwatch* clock)
 void
 SequenceDecoder::onOutputCloud(const CloudFrame& frame)
 {
+  // With several threads, write the frame while the next one is decoded
+  // NB: one frame is written at a time, in order
+  if (pcc::numThreads() > 1) {
+    if (_pendingWrite.valid())
+      _pendingWrite.get();
+    auto copy = std::make_shared<CloudFrame>(frame);
+    _pendingWrite = std::async(std::launch::async, [this, copy] {
+      writeOutputFrame(
+        params->reconstructedDataPath, params->preInvScalePath, *copy,
+        copy->cloud);
+    });
+    return;
+  }
+
   clock->stop();
 
   // copy the point cloud in order to modify it according to the output options

@@ -134,6 +134,7 @@ file(GLOB PROJECT_INC_FILES
   "lod_scan_simd.h"
   "motionWip.h"
   "osspecific.h"
+  "parallel.h"
   "partitioning.h"
   "pcc_chrono.h"
   "ply.h"
@@ -178,6 +179,7 @@ file(GLOB PROJECT_CPP_FILES
   "misc.cpp"
   "motionWip.cpp"
   "osspecific.cpp"
+  "parallel.cpp"
   "partitioning.cpp"
   "pcc_chrono.cpp"
   "ply.cpp"
@@ -207,6 +209,9 @@ add_executable (tmc3
   ${VERSION_FILE}
 )
 add_dependencies(tmc3 genversion)
+
+find_package(Threads REQUIRED)
+target_link_libraries(tmc3 Threads::Threads)
 
 add_executable (ply-merge EXCLUDE_FROM_ALL
   "../tools/ply-merge.cpp"
