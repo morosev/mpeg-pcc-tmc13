@@ -162,25 +162,38 @@ ply::write(
     fout.clear();
     fout.close();
     fout.open(fileName, std::ofstream::binary | std::ofstream::app);
+
+    // NB: the vertex data is assembled in memory and written as one block,
+    //     rather than written one property at a time to the stream.
+    std::vector<char> block;
+    block.reserve(
+      pointCount
+      * (sizeof(double) * 3 + (cloud.hasColors() ? 3 : 0)
+         + (cloud.hasReflectances() ? 2 : 0)
+         + (cloud.hasFrameIndex() ? 2 : 0)));
+    auto put = [&](const void* data, size_t size) {
+      const char* p = reinterpret_cast<const char*>(data);
+      block.insert(block.end(), p, p + size);
+    };
+
     for (size_t i = 0; i < pointCount; ++i) {
       Vec3<double> position = cloud[i] * positionScale + positionOffset;
-      fout.write(
-        reinterpret_cast<const char* const>(&position), sizeof(double) * 3);
+      put(&position, sizeof(double) * 3);
       if (cloud.hasColors()) {
         const Vec3<attr_t>& c = cloud.getColor(i);
         Vec3<uint8_t> val8b{uint8_t(c[0]), uint8_t(c[1]), uint8_t(c[2])};
-        fout.write(reinterpret_cast<const char*>(&val8b), sizeof(uint8_t) * 3);
+        put(&val8b, sizeof(uint8_t) * 3);
       }
       if (cloud.hasReflectances()) {
         const attr_t& reflectance = cloud.getReflectance(i);
-        fout.write(
-          reinterpret_cast<const char*>(&reflectance), sizeof(uint16_t));
+        put(&reflectance, sizeof(uint16_t));
       }
       if (cloud.hasFrameIndex()) {
         const uint16_t& findex = cloud.getFrameIndex(i);
-        fout.write(reinterpret_cast<const char*>(&findex), sizeof(uint16_t));
+        put(&findex, sizeof(uint16_t));
       }
     }
+    fout.write(block.data(), block.size());
   }
   fout.close();
   return true;
