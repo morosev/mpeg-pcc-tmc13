@@ -264,32 +264,48 @@ expandLevel(
 }
 
 //============================================================================
-// Search for neighbour with @value in the ordered list [first, last).
+// Search for neighbour with @value in the sorted @keys [0, count): the index
+// of the first key in the search window that is not less than @value, or -1
+// if there is none.
 //
 // If distance is positive, search [from, from+distance].
-// If distance is negative, search [from-distance, from].
+// If distance is negative, search [from-distance, from).
+//
+// NB: the keys are a contiguous copy of the node positions, and the lower
+//     bound is found without data-dependent branches.  The result is that
+//     of std::lower_bound over the same window.
 
-template<typename It, typename T, typename T2, typename Cmp>
-It
-findNeighbour(It first, It last, It from, T value, T2 distance, Cmp compare)
+static inline int
+findNeighbour(
+  const int64_t* keys, int count, int from, int64_t value, int64_t distance)
 {
-  It start = first;
-  It end = last;
+  int start = 0;
+  int end = count;
 
   if (distance >= 0) {
     start = from;
-    if ((distance + 1) < std::distance(from, last))
-      end = std::next(from, distance + 1);
+    if ((distance + 1) < count - from)
+      end = from + int(distance) + 1;
   } else {
     end = from;
-    if ((-distance) < std::distance(first, from))
-      start = std::prev(from, -distance);
+    if ((-distance) < from)
+      start = from - int(-distance);
   }
 
-  auto found = std::lower_bound(start, end, value, compare);
-  if (found == end)
-    return last;
-  return found;
+  int n = end - start;
+  if (n <= 0)
+    return -1;
+
+  // the lower bound is in [base, base + n]
+  const int64_t* base = keys + start;
+  while (n > 1) {
+    int half = n >> 1;
+    base = base[half] < value ? base + half : base;
+    n -= half;
+  }
+
+  int found = int(base - keys) + (*base < value);
+  return found == end ? -1 : found;
 }
 
 //============================================================================
@@ -301,6 +317,7 @@ void
 findNeighbours(
   It first,
   It last,
+  const int64_t* keys,
   It it,
   It firstChild,
   It lastChild,
@@ -348,23 +365,16 @@ findNeighbours(
       delta =
       (-delta) >= raht_prediction_search_range ? -raht_prediction_search_range : delta;
     // find neighbour
-    auto found = findNeighbour(
-      first, last, it, neigh_pos, delta,
-      [=](decltype(*it)& candidate, int64_t neigh_pos) {
-        return (candidate.pos >> level) < neigh_pos;
-      });
+    int found = findNeighbour(
+      keys, int(std::distance(first, last)), int(std::distance(first, it)),
+      neigh_pos, delta);
 
-    if (found == last) {
+    if (found < 0 || keys[found] != neigh_pos) {
       parentNeighIdx[i] = -1;
       continue;
     }
 
-    if ((found->pos >> level) != neigh_pos) {
-      parentNeighIdx[i] = -1;
-      continue;
-    }
-
-    parentNeighIdx[i] = std::distance(first, found);
+    parentNeighIdx[i] = found;
   }
 
   if (rahtSubnodePredictionEnabled) {
@@ -1134,6 +1144,10 @@ uraht_process(
 
   std::vector<UrahtNode> weightsParent;
   weightsParent.reserve(numPoints);
+  // positions of the parent nodes at the current level, for the neighbour
+  // search
+  std::vector<int64_t> parentKeys;
+  parentKeys.reserve(numPoints);
 
   std::vector<int> numParentNeigh, numGrandParentNeigh;
   numParentNeigh.resize(numPoints);
@@ -1233,6 +1247,10 @@ uraht_process(
           it++;
         weightsParent[i].lastChild = it;
       }
+
+      parentKeys.resize(parentCount);
+      for (auto i = 0; i < parentCount; i++)
+        parentKeys[i] = weightsParent[i].pos >> (level + 3);
     }
 
     int32_t* intraCoeffBufItK[3] = {
@@ -1404,7 +1422,8 @@ uraht_process(
           enablePrediction = false;
         } else {
           findNeighbours(
-            weightsParent.begin(), weightsParent.end(), weightsParentIt,
+            weightsParent.begin(), weightsParent.end(), parentKeys.data(),
+            weightsParentIt,
             weightsLf.begin(), weightsLf.begin() + i, level + 3, occupancy,
             parentNeighIdx, childNeighIdx,
             rahtPredParams.raht_subnode_prediction_enabled_flag, rahtPredParams.raht_prediction_search_range);
