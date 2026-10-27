@@ -7,7 +7,13 @@ AVX2), single-thread loop restructuring, and optional parallel execution.
 
 The goal is real-time coding of spinning lidar at 10 Hz: 100 ms per frame
 for encoding and for decoding, measured as end-to-end wall-clock time
-(including ply reading and the input azimuth sort) on a single thread.
+(including ply reading and writing and the input azimuth sort) on an
+Apple M5 Pro.
+
+Status: predictive geometry configurations meet the target on one
+thread; every lidar configuration, including octree geometry, meets it
+with four angular sector slices per frame coded on four threads.  All
+output is bit-exact with the original code for the same configuration.
 
 
 General analysis
@@ -201,18 +207,18 @@ Reflectance (attribute) coding time, LoD scan change only (commit
 | octree + predicting | 1.26x | 1.24x |
 
 End-to-end wall time per frame, predictive geometry (the real-time
-target):
+target), original code against the current code (all changes in this
+document, one thread, one slice per frame, best of three runs):
 
-| | Original | 9324a7c | 1b07bd5 |
-|---|---|---|---|
-| Encode, predgeom + predicting | 122.8 ms | 111.6 ms | **91.3 ms** |
-| Encode, predgeom + lifting | 145.9 ms | 120.0 ms | **98.7 ms** |
-| Decode, predgeom + predicting | 75.1 ms | | **61.3 ms** |
-| Decode, predgeom + lifting | 96.9 ms | | **68.6 ms** |
+| | Original | Current |
+|---|---|---|
+| Encode, predgeom + predicting | 119.0 ms | **89.0 ms** |
+| Encode, predgeom + lifting | 140.7 ms | **96.3 ms** |
+| Decode, predgeom + predicting | 72.0 ms | **58.0 ms** |
+| Decode, predgeom + lifting | 94.1 ms | **65.3 ms** |
 
-Octree configurations are not yet real-time: their encoder is dominated
-by the recolouring KD-tree, and octree + predicting decode by octree
-geometry decoding.
+Octree configurations reach the target only with several slices per
+frame coded concurrently (see [Parallel slices](#parallel-slices)).
 
 ### Verification
 
@@ -233,10 +239,6 @@ Each change was checked with:
 - AddressSanitizer and UndefinedBehaviorSanitizer runs.  UBSan only
   reports left shifts of negative values that the original code already
   performs and the new code keeps, to stay bit-exact.
-
-Measured but reverted (no measurable gain): calling the inline
-arithmetic coder functions directly, and keeping LoD search buffers
-between calls.
 
 
 Work done (Intel/AMD x86)
@@ -294,14 +296,10 @@ The x86 builds were cross-compiled on macOS (`clang -arch x86_64`, with
   (where `theta32` overflows 32 bits) gives identical results for every
   variant and agrees with the original scalar search.
 
-The randomised test found one bug during the port: the scalar tail of
-the SIMD `findLaserPrecise` (for laser counts that are not a multiple of
-the vector width) reused the expression `std::abs(theta32 - theta)`.  For
-points very close to the axis the subtraction overflows, which is
-undefined behaviour, and once inlined the compiler evaluated it
-differently from the vector lanes.  The tail now uses explicit 32-bit
-wrapping arithmetic, which is what the vector lanes compute and what the
-original scalar search compiles to on ARM and x86.
+The scalar tail of the SIMD `findLaserPrecise` uses explicit 32-bit
+wrapping arithmetic: near the axis `theta32 - theta` overflows, and the
+original `std::abs(theta32 - theta)` (undefined behaviour) could be
+evaluated differently from the vector lanes once inlined.
 
 No x86 performance figures are given: the x86 builds have only been run
 under Rosetta 2, whose timings do not represent Intel or AMD processors.
@@ -342,9 +340,6 @@ Measured and not pursued:
   symbols), but decoding was only ~6% faster and encoding ~5% slower; the
   coder runs at ~6 ns per symbol, limited by the dependency between
   symbols.
-- Restructuring the 27 Morton additions of the LoD neighbourhood: at most
-  ~1% of decode time.
-- Galloping search in RAHT: slower than the bounded binary search.
 - Trisoup ray tracing with SIMD: deferred; each ray needs three integer
   divisions, which would need exact vector division by a per-triangle
   constant.
@@ -402,8 +397,9 @@ first column is the code before the loop restructuring and parallel work
   pre-pass of the LoD search.
 - Gains level off beyond the performance cores: the remaining time is
   serial (arithmetic coding, octree and predictive geometry coding).
-- Octree encoding remains above 100 ms per frame; octree geometry coding
-  is now the dominant serial cost.
+- With one slice per frame, octree encoding remains above 100 ms per
+  frame, limited by octree geometry coding; several slices per frame
+  remove this limit (next section).
 
 ### Verification
 
@@ -482,10 +478,10 @@ sectors, eight for eight.
 
 Verification:
 
-- Decoding 17 multi-slice streams (4 and 8 sectors, square partitions of
-  ~22 slices per frame, dense RAHT, lifting and trisoup, inter prediction,
-  point count metadata with `decodeMaxPoints`) with 1, 2, 4 and 15
-  threads gives reconstructions and logs (except timing values) identical
+- Decoding 18 multi-slice streams (4 and 8 sectors, square partitions of
+  ~22 slices per frame, tiles, dense RAHT, lifting and trisoup, inter
+  prediction, point count metadata with `decodeMaxPoints`) with 1, 2, 4
+  and 15 threads gives reconstructions and logs (except timing values) identical
   to the previous decoder.
 - Encoding ten multi-slice configurations (including tiles, inter
   prediction and trisoup) with 1, 2, 4 and 15 threads gives bitstreams,
@@ -497,11 +493,12 @@ Verification:
 Remaining work
 --------------
 
-- Benchmark the x86 kernels on Intel and AMD processors, and measure
-  the overhead of the restructured LoD scans when SIMD is disabled (3-5%
-  on ARM).
-- Build and test with MSVC (x64 and ARM64) and with the CMake
-  `TMC3_SIMD` option, which have not been tested yet.
+- Benchmark the x86 kernels and the parallel scaling on Intel and AMD
+  processors, and measure the overhead of the restructured LoD scans
+  when SIMD is disabled (3-5% on ARM).
+- Build and test with MSVC (x64 and ARM64) and with CMake (the
+  `TMC3_SIMD` option and the thread library), which have not been tested
+  yet.
 - Confirm all results on real Ford sequences: the measurements so far use
   synthetic frames (about 143k points, more than typical Ford frames).
 - Single-threaded predgeom + lifting encode remains close to 100 ms; the
@@ -513,5 +510,3 @@ Remaining work
   depend on the reference frame, which could be shared read-only.
 - RAHT: check whether the transform's operands fit 32 bits for SIMD.
 - Trisoup: vectorise `rayTracingAlongdirection`.
-- Measure the parallel scaling on Intel and AMD processors, and with the
-  CMake build (which now links the thread library).
