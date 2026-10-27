@@ -589,7 +589,13 @@ typedef std::vector<VecVecVec3> VecVecVecVec3;
 
 class PredGeomPredictor {
 public:
-  PredGeomPredictor() : numLasers(0), azimScaleLog2(0), interEnabled(false) {}
+  PredGeomPredictor()
+    : numLasers(0)
+    , azimScaleLog2(0)
+    , interEnabled(false)
+    , globalMotionEnabled(false)
+    , enableResampling(false)
+  {}
 
   void init(int azim_scale_log2, int nLasers, const bool globMotionEnabled, const bool resamplingEnabled)
   {

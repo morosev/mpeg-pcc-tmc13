@@ -56,7 +56,7 @@ private:
   std::vector<bool> perFrameMovingStatus; 
 
 public:
-  MotionParameters() : numFrames(0), frameCounter(-1) {}
+  MotionParameters() : numFrames(0), frameCounter(-1), refFrameCounter(-1) {}
   bool EndOfFrames() const { return frameCounter >= numFrames; }
   void AdvanceFrame() { frameCounter++; }
   void setFrameCtr(const int frameCtr) { frameCounter = frameCtr; }
