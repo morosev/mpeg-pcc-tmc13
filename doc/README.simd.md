@@ -1,9 +1,9 @@
-SIMD optimisation of TMC13 (ARM NEON, Intel/AMD x86)
-=====================================================
+SIMD and parallel optimisation of TMC13
+=======================================
 
-This document records the analysis of TMC13 (`tmc3`) for SIMD
-optimisation and the work done for ARM NEON and Intel/AMD x86 (SSE4.1 and
-AVX2).
+This document records the analysis of TMC13 (`tmc3`) for optimisation, and
+the work done: SIMD kernels for ARM NEON and Intel/AMD x86 (SSE4.1 and
+AVX2), single-thread loop restructuring, and optional parallel execution.
 
 The goal is real-time coding of spinning lidar at 10 Hz: 100 ms per frame
 for encoding and for decoding, measured as end-to-end wall-clock time
@@ -307,6 +307,116 @@ No x86 performance figures are given: the x86 builds have only been run
 under Rosetta 2, whose timings do not represent Intel or AMD processors.
 
 
+Loop restructuring
+------------------
+
+Single-thread changes found by profiling every pipeline after the SIMD
+work.  All are bit-exact and apply to every target.
+
+| Change | Commit | Result (Apple M5 Pro) |
+|---|---|---|
+| Recolouring: 1-NN search for identical source points before the 8-NN search (`pointset_processing.cpp`) | f210a96 | Lossless-geometry encode: octree lidar 308 → 256 ms/frame, dense 4.16 → 3.32 s; lossy geometry unchanged |
+| Binary ply output written as one block (`ply.cpp`) | 3b4289f | Lidar decode −1.6 ms/frame |
+| RAHT neighbour search: branch-free lower bound over a contiguous copy of the parent positions (`RAHT.cpp`) | 54deaf9 | RAHT attribute decoding 714 → 535 ms (dense) |
+| Trisoup: block voxels sorted and deduplicated with an occupancy bitmap (`geometry_trisoup_decoder.cpp`) | d5d935f | Trisoup geometry decoding 665 → 495 ms (dense) |
+
+Notes on the exactness of each:
+
+- Recolouring: the first neighbour of a 1-NN search is the first neighbour
+  of the k-NN search (same traversal order; neither search can prune a
+  subtree holding a point at the minimum distance; both keep the first such
+  point).  Used only when the geometry is not scaled and the forward
+  geometry distance is unlimited (the default), since with a limited
+  distance the neighbour lists can shrink from one point to the next.
+- RAHT: the search window is unchanged and a sorted array has a single
+  lower bound.  The searches are short (about 6 steps, as the window is
+  bounded by the Morton distance), so the gain comes from contiguous loads
+  and the absence of mispredicted branches, not from fewer steps.
+- Trisoup: every refined voxel lies in its block, so reading the bitmap in
+  index order gives the order of `Vec3::operator<`.
+
+Measured and not pursued:
+
+- Arithmetic coder renormalisation with a count-leading-zeros shift
+  instead of the bit-wise loop: bit-exact (identical streams for 20M
+  symbols), but decoding was only ~6% faster and encoding ~5% slower; the
+  coder runs at ~6 ns per symbol, limited by the dependency between
+  symbols.
+- Restructuring the 27 Morton additions of the LoD neighbourhood: at most
+  ~1% of decode time.
+- Galloping search in RAHT: slower than the bounded binary search.
+- Trisoup ray tracing with SIMD: deferred; each ray needs three integer
+  divisions, which would need exact vector division by a per-triangle
+  constant.
+
+
+Parallel execution
+------------------
+
+`--numThreads=N` (default 1) enables parallel execution with a pool of
+`N - 1` worker threads plus the calling thread (`tmc3/parallel.h`).  With
+the default, no threads are created and the code runs as before.  The
+output does not depend on the number of threads: every parallel section
+writes only state that no other chunk reads or writes, and results that
+must be gathered in order are gathered sequentially.
+
+| Section | Exactness |
+|---|---|
+| LoD neighbour search (`computeNearestNeighbors`, encoder and decoder) | The state carried from point to point (position in the retained points, the atlas segment and its retained points) is derived in a sequential pre-pass, which also reproduces the reference behaviour of only entering retained points while their atlas id matches the current point.  Each thread has its own atlas; the inter-frame search remains sequential. |
+| Recolouring (encoder) | The two KD-trees are built concurrently.  The forward pass is parallel when the geometry distance is unlimited; backward searches are parallel and their results gathered in source order before the per-target sorts. |
+| Spherical conversion (predgeom encoder) and azimuth sort keys (input) | Pure functions of each point, computed in a parallel pre-pass. |
+| Input reading (encoder) | The next frame is read and sorted on a background task while the current frame is coded (not with bi-prediction, whose frame order differs). |
+| Output writing (decoder) | Each decoded frame is written on a background task while the next frame is decoded, one frame at a time, in order. |
+
+Work is distributed dynamically in chunks, which suits processors with
+performance and efficiency cores.  A job submitted while the pool is busy
+with another thread's job (eg, input reading) runs on the submitting
+thread.  Each thread working on the LoD search keeps its own 16 MB atlas.
+
+Note that the "Processing time (user)" reported by tmc3 is the CPU time of
+all threads, so wall time is the measure for parallel runs.
+
+### Results
+
+Apple M5 Pro (5 performance + 10 efficiency cores), 30 synthetic
+Ford-like lidar frames, end-to-end wall time per frame (including ply
+input and output and the input azimuth sort), best of three runs.  The
+first column is the code before the loop restructuring and parallel work
+(b794fcf).
+
+| Configuration | b794fcf | 1 thread | 2 threads | 4 threads | 8 threads |
+|---|---|---|---|---|---|
+| predgeom + predicting, encode | 87.3 ms | 89.3 ms | 63.2 ms | 54.0 ms | 49.9 ms |
+| predgeom + predicting, decode | 58.8 ms | 59.0 ms | 45.2 ms | 38.9 ms | 35.9 ms |
+| predgeom + lifting, encode | 94.7 ms | 97.2 ms | 67.6 ms | 56.7 ms | 52.1 ms |
+| predgeom + lifting, decode | 66.4 ms | 66.2 ms | 48.9 ms | 41.2 ms | 37.9 ms |
+| octree + predicting, encode | 299.8 ms | 254.9 ms | 219.8 ms | 185.7 ms | 177.7 ms |
+| octree + predicting, decode | 129.3 ms | 129.4 ms | 116.7 ms | 111.2 ms | 108.7 ms |
+| octree + lifting, encode | 230.1 ms | 230.8 ms | 180.3 ms | 127.6 ms | 114.0 ms |
+| octree + lifting, decode | 73.7 ms | 73.8 ms | 60.3 ms | 53.4 ms | 49.9 ms |
+
+- With two threads, predgeom encoding and decoding reach the 10 Hz target
+  (100 ms per frame) with a margin of over 30%.
+- The single-threaded predgeom encoder is about 1% slower than before
+  (0.7-1.1 ms per frame in interleaved runs), the cost of the sequential
+  pre-pass of the LoD search.
+- Gains level off beyond the performance cores: the remaining time is
+  serial (arithmetic coding, octree and predictive geometry coding).
+- Octree encoding remains above 100 ms per frame; octree geometry coding
+  is now the dominant serial cost.
+
+### Verification
+
+- Every lidar configuration and the dense RAHT, lifting, trisoup and lossy
+  geometry configurations give bitstreams and reconstructions identical to
+  the single-threaded run with 2, 4, 8 and 15 threads, also for clouds
+  with duplicated points, fewer points than recolouring neighbours, four
+  backward neighbours with a limited distance, and an input frame range
+  that runs past the available files (identical partial output and error).
+- ThreadSanitizer reports no data races with 4 threads for the lidar and
+  dense configurations.
+
+
 Remaining work
 --------------
 
@@ -317,16 +427,13 @@ Remaining work
   `TMC3_SIMD` option, which have not been tested yet.
 - Confirm all results on real Ford sequences: the measurements so far use
   synthetic frames (about 143k points, more than typical Ford frames).
-- More margin for predgeom + lifting encode (98.7 ms): the remaining time
-  is mostly the LoD candidate scans, the arithmetic coder, `atan2`, and
-  the per-point laser search in the input azimuth sort.  Reading and
-  sorting the next frame on a second thread while the current frame is
-  encoded would hide most of the ~10 ms of input work without changing
-  the bitstream, at the cost of a second core.
-- Octree configurations: replace the double-precision, dynamic-dimension
-  KD-tree used for recolouring (encoder), and look at octree geometry
-  decoding.
-- RAHT: store node positions as a separate array and use branch-free or
-  SIMD k-ary search in `findNeighbours`; check whether the transform's
-  operands fit 32 bits.
-- Trisoup: vectorise `rayTracingAlongdirection` (four rays per vector).
+- Single-threaded predgeom + lifting encode remains close to 100 ms; the
+  remaining time is mostly the LoD candidate scans, the arithmetic coder,
+  `atan2` and the laser search of the input azimuth sort.
+- Octree geometry coding, which now dominates octree lidar encode and
+  decode, is serial; independent slices could be coded in parallel where
+  slices do not share entropy state or references.
+- RAHT: check whether the transform's operands fit 32 bits for SIMD.
+- Trisoup: vectorise `rayTracingAlongdirection`.
+- Measure the parallel scaling on Intel and AMD processors, and with the
+  CMake build (which now links the thread library).
