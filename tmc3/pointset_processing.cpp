@@ -229,6 +229,29 @@ clampVolume(Box3<double> bbox, PCCPointSet3* cloud)
 }
 
 //============================================================================
+// Find a source point identical to the position pos, using a 1-NN search.
+//
+// With lossless geometry, almost every target point has an identical source
+// point, which is the only point the forward recolouring pass then uses
+// (skipAvgIfIdenticalSourcePointPresentFwd).  The nearest neighbour found by
+// a 1-NN search is the first neighbour that the full k-NN search finds: both
+// traverse the tree in the same order, no subtree that contains a point at
+// the minimum distance can be pruned by either, and both keep the first such
+// point found.  The full search is then only needed when there is no
+// identical point.
+
+template<typename KdTree>
+static bool
+findIdenticalPoint(const KdTree& tree, const Vec3<double>& pos, size_t* index)
+{
+  double dist2;
+  nanoflann::KNNResultSet<double> resultSet(1);
+  resultSet.init(index, &dist2);
+  tree.index->findNeighbors(resultSet, &pos[0], nanoflann::SearchParams(10));
+  return dist2 < 0.0001;
+}
+
+//============================================================================
 // Determine colour attribute values from a reference/source point cloud.
 // For each point of the target p_t:
 //  - Find the N_1 (1 < N_1) nearest neighbours in source to p_t and create
@@ -295,11 +318,25 @@ recolourColour(
   nanoflann::KNNResultSet<double> resultSetFwd(num_resultsFwd);
   std::vector<size_t> indicesFwd(num_resultsFwd);
   std::vector<double> sqrDistFwd(num_resultsFwd);
+  // NB: with a limited geometry distance, each full search can change the
+  //     state of the forward pass, so every point needs the full search
+  const bool tryIdenticalFwd = params.skipAvgIfIdenticalSourcePointPresentFwd
+    && maxGeometryDist2Fwd == std::numeric_limits<double>::max()
+    && sourceToTargetScaleFactor == 1.;
+
   for (size_t index = 0; index < pointCountTarget; ++index) {
     resultSetFwd.init(&indicesFwd[0], &sqrDistFwd[0]);
 
     Vec3<double> posInSrc =
       (target[index] + targetToSourceOffset) * targetToSourceScaleFactor;
+
+    size_t identicalIdx;
+    if (
+      tryIdenticalFwd
+      && findIdenticalPoint(kdtreeSource, posInSrc, &identicalIdx)) {
+      refinedColors1[index] = source.getColor(identicalIdx);
+      continue;
+    }
 
     kdtreeSource.index->findNeighbors(
       resultSetFwd, &posInSrc[0], nanoflann::SearchParams(10));
@@ -658,11 +695,25 @@ recolourReflectance(
   nanoflann::KNNResultSet<double> resultSetFwd(num_resultsFwd);
   std::vector<size_t> indicesFwd(num_resultsFwd);
   std::vector<double> sqrDistFwd(num_resultsFwd);
+  // NB: with a limited geometry distance, each full search can change the
+  //     state of the forward pass, so every point needs the full search
+  const bool tryIdenticalFwd = cfg.skipAvgIfIdenticalSourcePointPresentFwd
+    && maxGeometryDist2Fwd == std::numeric_limits<double>::max()
+    && sourceToTargetScaleFactor == 1.;
+
   for (size_t index = 0; index < pointCountTarget; ++index) {
     resultSetFwd.init(&indicesFwd[0], &sqrDistFwd[0]);
 
     Vec3<double> posInSrc =
       (target[index] + targetToSourceOffset) * targetToSourceScaleFactor;
+
+    size_t identicalIdx;
+    if (
+      tryIdenticalFwd
+      && findIdenticalPoint(kdtreeSource, posInSrc, &identicalIdx)) {
+      refinedReflectances1[index] = source.getReflectance(identicalIdx);
+      continue;
+    }
 
     kdtreeSource.index->findNeighbors(
       resultSetFwd, &posInSrc[0], nanoflann::SearchParams(10));
