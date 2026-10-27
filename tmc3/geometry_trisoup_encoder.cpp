@@ -37,6 +37,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include "geometry_trisoup.h"
+#include "parallel.h"
 
 #include "pointset_processing.h"
 #include "geometry.h"
@@ -129,8 +130,8 @@ encodeGeometryTrisoup(
   const bool isFaceVertexActivated = gbh.trisoup_face_vertex_flag;
 
   // Determine vertices
-  std::cout << "Number of points = " << pointCloud.getPointCount() << "\n";
-  std::cout << "Number of nodes = " << nodes.size() << "\n";
+  codingLog() << "Number of points = " << pointCloud.getPointCount() << "\n";
+  codingLog() << "Number of nodes = " << nodes.size() << "\n";
   float estimatedSampling = 1;
   int distanceSearchEncoder = 1;
   if (opt.improvedVertexDetermination) {
@@ -139,12 +140,12 @@ encodeGeometryTrisoup(
     estimatedSampling = std::sqrt(estimatedSampling);
     estimatedSampling *= blockWidth;
     estimatedSampling = std::max(1.f, estimatedSampling);
-    std::cout << "Estimation of sampling = " << estimatedSampling << "\n";
+    codingLog() << "Estimation of sampling = " << estimatedSampling << "\n";
 
     distanceSearchEncoder = (1 << std::max(0, bitDropped - 2)) - 1;
     distanceSearchEncoder += int(std::round(estimatedSampling + 0.1f));
     distanceSearchEncoder = std::max(1, std::min(8, distanceSearchEncoder));
-    std::cout << "distanceSearchEncoder = " << distanceSearchEncoder << "\n";
+    codingLog() << "distanceSearchEncoder = " << distanceSearchEncoder << "\n";
   }
 
   std::vector<node6nei> nodes6nei;
@@ -205,7 +206,7 @@ encodeGeometryTrisoup(
 
   int subsample = 1;
   int32_t maxval = (1 << gbh.maxRootNodeDimLog2) - 1;
-  std::cout << "Loop on sampling for max "
+  codingLog() << "Loop on sampling for max "
             << (gbh.footer.geom_num_points_minus1 + 1) << " points \n";
   if (gps.trisoup_sampling_value > 0) {
     subsample = gps.trisoup_sampling_value;
@@ -214,7 +215,7 @@ encodeGeometryTrisoup(
       recPointCloud, gps, gbh, blockWidth, maxval, subsample, bitDropped,
       isCentroidDriftActivated, isFaceVertexActivated, haloFlag,
       adaptiveHaloFlag, fineRayFlag);
-    std::cout << "Sub-sampling " << subsample << " gives "
+    codingLog() << "Sub-sampling " << subsample << " gives "
               << recPointCloud.getPointCount() << " points \n";
   } else {
     int maxSubsample = 1 << gbh.trisoupNodeSizeLog2(gps);
@@ -224,7 +225,7 @@ encodeGeometryTrisoup(
         fVerts, recPointCloud, gps, gbh, blockWidth, maxval, subsample,
         bitDropped, isCentroidDriftActivated, isFaceVertexActivated, haloFlag,
         adaptiveHaloFlag, fineRayFlag);
-      std::cout << "Sub-sampling " << subsample << " gives "
+      codingLog() << "Sub-sampling " << subsample << " gives "
                 << recPointCloud.getPointCount() << " points \n";
       if (recPointCloud.getPointCount() <= gbh.footer.geom_num_points_minus1 + 1)
         break;

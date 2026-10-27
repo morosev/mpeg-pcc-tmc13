@@ -36,7 +36,11 @@
 #pragma once
 
 #include <functional>
+#include <iostream>
 #include <map>
+#include <memory>
+#include <ostream>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -224,6 +228,17 @@ public:
 private:
   void appendSlice(PCCPointSet3& cloud);
 
+  // Parallel encoding of the slices of a frame
+  bool canEncodeSlicesInParallel(const EncoderParams* params) const;
+  void compressPartitionsInParallel(
+    const PartitionSet& partitions,
+    const SrcMappedPointSet& quantizedInput,
+    const PCCPointSet3& inputPointCloud,
+    EncoderParams* params,
+    Callbacks* callback,
+    CloudFrame* reconCloud,
+    CloudFrame* reconCloudAlt);
+
   void encodeGeometryBrick(const EncoderParams*, PayloadBuffer* buf);
 
   SrcMappedPointSet quantization(const PCCPointSet3& src);
@@ -304,6 +319,11 @@ private:
   BiPredictionEncodeParams biPredEncodeParams;
   HierarchicalGOFParams hGOFEncodeParams;
 
+  // Destination of the slice encoding messages
+  std::ostream* _log = &std::cout;
+
+  // Slice encoding messages of a slice encoded by a worker
+  std::unique_ptr<std::ostringstream> _logBuffer;
 };
 
 //----------------------------------------------------------------------------

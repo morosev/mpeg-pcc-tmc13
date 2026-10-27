@@ -34,8 +34,10 @@
  */
 
 #include "PCCTMC3Encoder.h"
+#include "parallel.h"
 
 #include <cassert>
+#include <exception>
 #include <limits>
 #include <set>
 #include <stdexcept>
@@ -542,32 +544,38 @@ PCCTMC3Encoder3::compress(
   //  - compress
   pcc::CloudFrame reconCloudAlt;
 
-  for (const auto& partition : partitions.slices) {
-    // create partitioned point set
-    PCCPointSet3 sliceCloud =
-      getPartition(quantizedInput.cloud, partition.pointIndexes);
-
-    PCCPointSet3 sliceCloudPadding;
-    if (!params->trisoupNodeSizesLog2.empty()) {
-      sliceCloudPadding =
-        getPartition(quantizedInput.cloud, partition.pointIndexesPadding);
-
-      PCCPointSet3 sliceCloudPadding2 =
-        getPartition(quantizedInput.cloud, partition.pointIndexesPadding2);
-
-      sliceCloudPadding.append(sliceCloudPadding2);
-    }
-
-    PCCPointSet3 sliceSrcCloud =
-      getPartition(inputPointCloud, quantizedInput, partition.pointIndexes);
-
-    _sliceId = partition.sliceId;
-    _tileId = partition.tileId;
-    _sliceOrigin = sliceCloud.computeBoundingBox().min;
-
-    compressPartition(
-      sliceCloud, sliceSrcCloud, sliceCloudPadding, params, callback,
+  if (partitions.slices.size() > 1 && canEncodeSlicesInParallel(params)) {
+    compressPartitionsInParallel(
+      partitions, quantizedInput, inputPointCloud, params, callback,
       reconCloud, &reconCloudAlt);
+  } else {
+    for (const auto& partition : partitions.slices) {
+      // create partitioned point set
+      PCCPointSet3 sliceCloud =
+        getPartition(quantizedInput.cloud, partition.pointIndexes);
+
+      PCCPointSet3 sliceCloudPadding;
+      if (!params->trisoupNodeSizesLog2.empty()) {
+        sliceCloudPadding =
+          getPartition(quantizedInput.cloud, partition.pointIndexesPadding);
+
+        PCCPointSet3 sliceCloudPadding2 =
+          getPartition(quantizedInput.cloud, partition.pointIndexesPadding2);
+
+        sliceCloudPadding.append(sliceCloudPadding2);
+      }
+
+      PCCPointSet3 sliceSrcCloud =
+        getPartition(inputPointCloud, quantizedInput, partition.pointIndexes);
+
+      _sliceId = partition.sliceId;
+      _tileId = partition.tileId;
+      _sliceOrigin = sliceCloud.computeBoundingBox().min;
+
+      compressPartition(
+        sliceCloud, sliceSrcCloud, sliceCloudPadding, params, callback,
+        reconCloud, &reconCloudAlt);
+    }
   }
 
   const PCCPointSet3 accurrentPointCloud =(reconCloud) ? reconCloud->cloud : PCCPointSet3{};
@@ -920,6 +928,185 @@ PCCTMC3Encoder3::biPredictionEligibility(
 }
 //----------------------------------------------------------------------------
 
+//============================================================================
+// Parallel encoding of the slices of a frame.
+//
+// Without inter prediction and entropy continuation, each slice is encoded
+// from reset contexts.  The slices of a frame are then encoded concurrently,
+// each by its own encoder initialised from the frame-level state, with its
+// own copy of the encoder parameters (the slice header template is written
+// per slice).  The outputs, reconstructions and messages are then emitted
+// in slice order, as if the slices had been encoded one after the other.
+
+bool
+PCCTMC3Encoder3::canEncodeSlicesInParallel(const EncoderParams* params) const
+{
+  return numThreads() > 1 && !_sps->inter_frame_prediction_enabled_flag
+    && !_sps->entropy_continuation_enabled_flag
+    && !_sps->inter_entropy_continuation_enabled_flag
+    && !_gps->interPredictionEnabledFlag && !_gps->biPredictionEnabledFlag
+    && !_gps->globalMotionEnabled && !_codeCurrFrameAsInter;
+}
+
+//----------------------------------------------------------------------------
+
+void
+PCCTMC3Encoder3::compressPartitionsInParallel(
+  const PartitionSet& partitions,
+  const SrcMappedPointSet& quantizedInput,
+  const PCCPointSet3& inputPointCloud,
+  EncoderParams* params,
+  PCCTMC3Encoder3::Callbacks* callback,
+  CloudFrame* reconCloud,
+  CloudFrame* reconCloudAlt)
+{
+  // Records the callbacks of a slice, in order
+  struct BufferedCallbacks : Callbacks {
+    std::vector<PayloadBuffer> payloads;
+    std::vector<PCCPointSet3> recoloured;
+    std::vector<bool> isPayload;
+
+    void onOutputBuffer(const PayloadBuffer& buf) override
+    {
+      payloads.push_back(buf);
+      isPayload.push_back(true);
+    }
+
+    void onPostRecolour(const PCCPointSet3& cloud) override
+    {
+      recoloured.push_back(cloud);
+      isPayload.push_back(false);
+    }
+  };
+
+  struct SliceWork {
+    std::unique_ptr<PCCTMC3Encoder3> encoder;
+    EncoderParams params;
+    BufferedCallbacks callbacks;
+    CloudFrame recon;
+    CloudFrame reconAlt;
+    std::exception_ptr error;
+  };
+
+  const auto& slices = partitions.slices;
+  std::vector<SliceWork> work(slices.size());
+
+  parallelFor(slices.size(), 1, [&](int64_t begin, int64_t end) {
+    for (int64_t i = begin; i < end; i++) {
+      const auto& partition = slices[i];
+      auto& w = work[i];
+      try {
+        // create partitioned point set
+        PCCPointSet3 sliceCloud =
+          getPartition(quantizedInput.cloud, partition.pointIndexes);
+
+        PCCPointSet3 sliceCloudPadding;
+        if (!params->trisoupNodeSizesLog2.empty()) {
+          sliceCloudPadding =
+            getPartition(quantizedInput.cloud, partition.pointIndexesPadding);
+
+          PCCPointSet3 sliceCloudPadding2 = getPartition(
+            quantizedInput.cloud, partition.pointIndexesPadding2);
+
+          sliceCloudPadding.append(sliceCloudPadding2);
+        }
+
+        PCCPointSet3 sliceSrcCloud =
+          getPartition(inputPointCloud, quantizedInput, partition.pointIndexes);
+
+        // An encoder with the frame-level state, as left by the previous
+        // slice in the frame
+        w.params = *params;
+        w.encoder.reset(new PCCTMC3Encoder3);
+        auto& enc = *w.encoder;
+        enc._inputDecimationScale = _inputDecimationScale;
+        enc._srcToCodingScale = _srcToCodingScale;
+        enc._originInCodingCoords = _originInCodingCoords;
+        enc._sps = _sps;
+        enc._gps = _gps;
+        enc._aps = _aps;
+        enc._frameCounter = _frameCounter;
+        enc._firstSliceInFrame = i ? false : _firstSliceInFrame;
+        enc._prevSliceId = i ? slices[i - 1].sliceId : _prevSliceId;
+        enc._ctxtMemAttrs = _ctxtMemAttrs;
+        enc._ctxtMemAttrSliceIds = _ctxtMemAttrSliceIds;
+        enc._codeCurrFrameAsInter = _codeCurrFrameAsInter;
+        enc._refFrameSph = _refFrameSph;
+        enc.motionVectorFileName = motionVectorFileName;
+        enc.attrInterPredParams = attrInterPredParams;
+        enc.minPos_ref = minPos_ref;
+        enc._refFrame = _refFrame;
+        enc._refFrameAlt = _refFrameAlt;
+        enc.biPredEncodeParams = biPredEncodeParams;
+        enc.hGOFEncodeParams = hGOFEncodeParams;
+        enc._logBuffer.reset(new std::ostringstream);
+        enc._log = enc._logBuffer.get();
+
+        enc._sliceId = partition.sliceId;
+        enc._tileId = partition.tileId;
+        enc._sliceOrigin = sliceCloud.computeBoundingBox().min;
+
+        CodingLogRedirect redirect(*enc._log);
+        enc.compressPartition(
+          sliceCloud, sliceSrcCloud, sliceCloudPadding, &w.params,
+          &w.callbacks, reconCloud ? &w.recon : nullptr,
+          reconCloudAlt ? &w.reconAlt : nullptr);
+      }
+      catch (...) {
+        w.error = std::current_exception();
+      }
+    }
+  });
+
+  // Emit the slices in order
+  for (auto& w : work) {
+    if (w.encoder)
+      *_log << w.encoder->_logBuffer->str();
+
+    auto payload = w.callbacks.payloads.begin();
+    auto recoloured = w.callbacks.recoloured.begin();
+    for (bool isPayload : w.callbacks.isPayload) {
+      if (isPayload)
+        callback->onOutputBuffer(*payload++);
+      else
+        callback->onPostRecolour(*recoloured++);
+    }
+
+    if (w.error)
+      std::rethrow_exception(w.error);
+
+    if (reconCloud)
+      reconCloud->cloud.append(w.recon.cloud);
+    if (reconCloudAlt)
+      reconCloudAlt->cloud.append(w.reconAlt.cloud);
+  }
+
+  // The state as left by the last slice
+  auto& last = *work.back().encoder;
+  params->gbh = work.back().params.gbh;
+  pointCloud.swap(last.pointCloud);
+  pointCloudPadding.swap(last.pointCloudPadding);
+  _posSph = std::move(last._posSph);
+  _sliceOrigin = last._sliceOrigin;
+  _sliceBoxWhd = last._sliceBoxWhd;
+  _gbh = last._gbh;
+  _firstSliceInFrame = last._firstSliceInFrame;
+  _sliceId = last._sliceId;
+  _prevSliceId = last._prevSliceId;
+  _tileId = last._tileId;
+  _ctxtMemAttrSliceIds = last._ctxtMemAttrSliceIds;
+  _refFrameSph = std::move(last._refFrameSph);
+  // NB: only predictive geometry slices set previousAsInter
+  if (_gps->predgeom_enabled_flag)
+    previousAsInter = last.previousAsInter;
+  attrInterPredParams = std::move(last.attrInterPredParams);
+  movingState = last.movingState;
+  minPos_ref = last.minPos_ref;
+  biPredEncodeParams = std::move(last.biPredEncodeParams);
+}
+
+//----------------------------------------------------------------------------
+
 void
 PCCTMC3Encoder3::compressPartition(
   const PCCPointSet3& inputPointCloud,
@@ -1007,12 +1194,12 @@ PCCTMC3Encoder3::compressPartition(
     clock_user.stop();
 
     double bpp = double(8 * payload.size()) / inputPointCloud.getPointCount();
-    std::cout << "positions bitstream size " << payload.size() << " B (" << bpp
+    *_log << "positions bitstream size " << payload.size() << " B (" << bpp
               << " bpp)\n";
 
     auto total_user = std::chrono::duration_cast<std::chrono::milliseconds>(
       clock_user.count());
-    std::cout << "positions processing time (user): "
+    *_log << "positions processing time (user): "
               << total_user.count() / 1000.0 << " s" << std::endl;
 
     callback->onOutputBuffer(payload);
@@ -1261,12 +1448,12 @@ PCCTMC3Encoder3::compressPartition(
 
     int coded_size = int(payload.size());
     double bpp = double(8 * coded_size) / inputPointCloud.getPointCount();
-    std::cout << label << "s bitstream size " << coded_size << " B (" << bpp
+    *_log << label << "s bitstream size " << coded_size << " B (" << bpp
               << " bpp)\n";
 
     auto time_user = std::chrono::duration_cast<std::chrono::milliseconds>(
       clock_user.count());
-    std::cout << label
+    *_log << label
               << "s processing time (user): " << time_user.count() / 1000.0
               << " s" << std::endl;
 
