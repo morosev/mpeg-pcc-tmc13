@@ -34,6 +34,7 @@
  */
 
 #include "geometry_predictive.h"
+#include "parallel.h"
 #include "geometry.h"
 #include "pointset_processing.h"
 #include "quantization.h"
@@ -1319,7 +1320,15 @@ generateGeomPredictionTreeAngular(
   std::vector<int32_t> firstNodesObj(numLasers, -1);
 
   bool isRoad=false;
-  CartesianToSpherical cartToSpherical(gps);
+
+  // Convert the first point of each run of duplicate points to spherical
+  // coordinates.  The conversions are independent and made concurrently.
+  parallelFor(pointCount, 4096, [&](int64_t first, int64_t last) {
+    CartesianToSpherical cartToSpherical(gps);
+    for (int64_t i = first; i < last; i++)
+      if (!i || begin[i] != begin[i - 1])
+        beginSph[i] = cartToSpherical(begin[i] - origin);
+  });
 
   for (int nodeIdx = 0, nodeIdxN; nodeIdx < pointCount; nodeIdx = nodeIdxN) {
     auto curPoint = begin[nodeIdx];
@@ -1338,9 +1347,8 @@ generateGeomPredictionTreeAngular(
       node.numDups++;
     }
 
-    // cartesian to spherical coordinates
-    const auto carPos = curPoint - origin;
-    auto& sphPos = beginSph[nodeIdx] = cartToSpherical(carPos);
+    // cartesian to spherical coordinates (converted above)
+    const auto sphPos = beginSph[nodeIdx];
     auto thetaIdx = sphPos[2];
 
     // propagate converted coordinates over duplicate points

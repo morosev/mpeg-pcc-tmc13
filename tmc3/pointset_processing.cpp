@@ -34,13 +34,16 @@
  */
 
 #include "pointset_processing.h"
+#include "parallel.h"
 
 #include "colourspace.h"
 #include "hls.h"
 #include "KDTreeVectorOfVectorsAdaptor.h"
 
+#include <algorithm>
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <set>
 #include <vector>
 #include <utility>
@@ -240,6 +243,11 @@ clampVolume(Box3<double> bbox, PCCPointSet3* cloud)
 // point found.  The full search is then only needed when there is no
 // identical point.
 
+// Number of points per chunk of work in recolouring
+static const int64_t kRecolourGrain = 2048;
+
+//----------------------------------------------------------------------------
+
 template<typename KdTree>
 static bool
 findIdenticalPoint(const KdTree& tree, const Vec3<double>& pos, size_t* index)
@@ -289,10 +297,14 @@ recolourColour(
     return false;
   }
 
-  KDTreeVectorOfVectorsAdaptor<PCCPointSet3, double> kdtreeTarget(
-    3, target, 10);
-  KDTreeVectorOfVectorsAdaptor<PCCPointSet3, double> kdtreeSource(
-    3, source, 10);
+  // NB: the two trees are built concurrently
+  using KdTree = KDTreeVectorOfVectorsAdaptor<PCCPointSet3, double>;
+  std::unique_ptr<KdTree> kdtreeTargetPtr, kdtreeSourcePtr;
+  parallelInvoke(
+    [&] { kdtreeTargetPtr.reset(new KdTree(3, target, 10)); },
+    [&] { kdtreeSourcePtr.reset(new KdTree(3, source, 10)); });
+  const KdTree& kdtreeTarget = *kdtreeTargetPtr;
+  const KdTree& kdtreeSource = *kdtreeSourcePtr;
 
   target.addColors();
   std::vector<Vec3<attr_t>> refinedColors1;
@@ -315,115 +327,122 @@ recolourColour(
 
   // Forward direction
   const int num_resultsFwd = params.numNeighboursFwd;
-  nanoflann::KNNResultSet<double> resultSetFwd(num_resultsFwd);
-  std::vector<size_t> indicesFwd(num_resultsFwd);
-  std::vector<double> sqrDistFwd(num_resultsFwd);
   // NB: with a limited geometry distance, each full search can change the
   //     state of the forward pass, so every point needs the full search
   const bool tryIdenticalFwd = params.skipAvgIfIdenticalSourcePointPresentFwd
     && maxGeometryDist2Fwd == std::numeric_limits<double>::max()
     && sourceToTargetScaleFactor == 1.;
 
-  for (size_t index = 0; index < pointCountTarget; ++index) {
-    resultSetFwd.init(&indicesFwd[0], &sqrDistFwd[0]);
+  // Process the target points [begin, end)
+  // NB: with a limited geometry distance, the neighbour lists can shrink
+  //     from one point to the next, and the points are processed in order;
+  //     otherwise each point is independent
+  auto forwardPass = [&](int64_t begin, int64_t end) {
+    nanoflann::KNNResultSet<double> resultSetFwd(num_resultsFwd);
+    std::vector<size_t> indicesFwd(num_resultsFwd);
+    std::vector<double> sqrDistFwd(num_resultsFwd);
+    for (size_t index = begin; index < end; ++index) {
+      resultSetFwd.init(&indicesFwd[0], &sqrDistFwd[0]);
 
-    Vec3<double> posInSrc =
-      (target[index] + targetToSourceOffset) * targetToSourceScaleFactor;
+      Vec3<double> posInSrc =
+        (target[index] + targetToSourceOffset) * targetToSourceScaleFactor;
 
-    size_t identicalIdx;
-    if (
-      tryIdenticalFwd
-      && findIdenticalPoint(kdtreeSource, posInSrc, &identicalIdx)) {
-      refinedColors1[index] = source.getColor(identicalIdx);
-      continue;
-    }
-
-    kdtreeSource.index->findNeighbors(
-      resultSetFwd, &posInSrc[0], nanoflann::SearchParams(10));
-
-    while (1) {
-      if (indicesFwd.size() == 1)
-        break;
-
-      if (sqrDistFwd[int(resultSetFwd.size()) - 1] <= maxGeometryDist2Fwd)
-        break;
-
-      sqrDistFwd.pop_back();
-      indicesFwd.pop_back();
-    }
-
-    bool isDone = false;
-    if (params.skipAvgIfIdenticalSourcePointPresentFwd) {
-      if (sqrDistFwd[0] < 0.0001) {
-        refinedColors1[index] = source.getColor(indicesFwd[0]);
-        isDone = true;
-      }
-    }
-
-    if (isDone)
-      continue;
-
-    int nNN = indicesFwd.size();
-    while (nNN > 0 && !isDone) {
-      if (nNN == 1) {
-        refinedColors1[index] = source.getColor(indicesFwd[0]);
-        isDone = true;
-        break;
+      size_t identicalIdx;
+      if (
+        tryIdenticalFwd
+        && findIdenticalPoint(kdtreeSource, posInSrc, &identicalIdx)) {
+        refinedColors1[index] = source.getColor(identicalIdx);
+        continue;
       }
 
-      std::vector<Vec3<attr_t>> colors;
-      colors.resize(0);
-      colors.resize(nNN);
-      for (int i = 0; i < nNN; ++i) {
-        for (int k = 0; k < 3; ++k) {
-          colors[i][k] = double(source.getColor(indicesFwd[i])[k]);
+      kdtreeSource.index->findNeighbors(
+        resultSetFwd, &posInSrc[0], nanoflann::SearchParams(10));
+
+      while (1) {
+        if (indicesFwd.size() == 1)
+          break;
+
+        if (sqrDistFwd[int(resultSetFwd.size()) - 1] <= maxGeometryDist2Fwd)
+          break;
+
+        sqrDistFwd.pop_back();
+        indicesFwd.pop_back();
+      }
+
+      bool isDone = false;
+      if (params.skipAvgIfIdenticalSourcePointPresentFwd) {
+        if (sqrDistFwd[0] < 0.0001) {
+          refinedColors1[index] = source.getColor(indicesFwd[0]);
+          isDone = true;
         }
       }
-      double maxAttributeDist2 = std::numeric_limits<double>::min();
-      for (int i = 0; i < nNN; ++i) {
-        for (int j = 0; j < nNN; ++j) {
-          const double dist2 = (colors[i] - colors[j]).getNorm2<double>();
-          if (dist2 > maxAttributeDist2) {
-            maxAttributeDist2 = dist2;
+
+      if (isDone)
+        continue;
+
+      int nNN = indicesFwd.size();
+      while (nNN > 0 && !isDone) {
+        if (nNN == 1) {
+          refinedColors1[index] = source.getColor(indicesFwd[0]);
+          isDone = true;
+          break;
+        }
+
+        std::vector<Vec3<attr_t>> colors;
+        colors.resize(0);
+        colors.resize(nNN);
+        for (int i = 0; i < nNN; ++i) {
+          for (int k = 0; k < 3; ++k) {
+            colors[i][k] = double(source.getColor(indicesFwd[i])[k]);
           }
         }
-      }
-      if (maxAttributeDist2 > maxAttributeDist2Fwd) {
-        --nNN;
-      } else {
-        Vec3<double> refinedColor(0.0);
-        if (params.useDistWeightedAvgFwd) {
-          double sumWeights{0.0};
-          for (int i = 0; i < nNN; ++i) {
-            const double weight = 1 / (sqrDistFwd[i] + params.distOffsetFwd);
-            for (int k = 0; k < 3; ++k) {
-              refinedColor[k] += source.getColor(indicesFwd[i])[k] * weight;
+        double maxAttributeDist2 = std::numeric_limits<double>::min();
+        for (int i = 0; i < nNN; ++i) {
+          for (int j = 0; j < nNN; ++j) {
+            const double dist2 = (colors[i] - colors[j]).getNorm2<double>();
+            if (dist2 > maxAttributeDist2) {
+              maxAttributeDist2 = dist2;
             }
-            sumWeights += weight;
           }
-          refinedColor /= sumWeights;
+        }
+        if (maxAttributeDist2 > maxAttributeDist2Fwd) {
+          --nNN;
         } else {
-          for (int i = 0; i < nNN; ++i) {
-            for (int k = 0; k < 3; ++k) {
-              refinedColor[k] += source.getColor(indicesFwd[i])[k];
+          Vec3<double> refinedColor(0.0);
+          if (params.useDistWeightedAvgFwd) {
+            double sumWeights{0.0};
+            for (int i = 0; i < nNN; ++i) {
+              const double weight = 1 / (sqrDistFwd[i] + params.distOffsetFwd);
+              for (int k = 0; k < 3; ++k) {
+                refinedColor[k] += source.getColor(indicesFwd[i])[k] * weight;
+              }
+              sumWeights += weight;
             }
+            refinedColor /= sumWeights;
+          } else {
+            for (int i = 0; i < nNN; ++i) {
+              for (int k = 0; k < 3; ++k) {
+                refinedColor[k] += source.getColor(indicesFwd[i])[k];
+              }
+            }
+            refinedColor /= nNN;
           }
-          refinedColor /= nNN;
+          for (int k = 0; k < 3; ++k) {
+            refinedColors1[index][k] =
+              attr_t(PCCClip(round(refinedColor[k]), 0.0, clipMax[k]));
+          }
+          isDone = true;
         }
-        for (int k = 0; k < 3; ++k) {
-          refinedColors1[index][k] =
-            attr_t(PCCClip(round(refinedColor[k]), 0.0, clipMax[k]));
-        }
-        isDone = true;
       }
     }
-  }
+  };
+  if (maxGeometryDist2Fwd == std::numeric_limits<double>::max())
+    parallelFor(pointCountTarget, kRecolourGrain, forwardPass);
+  else
+    forwardPass(0, pointCountTarget);
 
   // Backward direction
   const size_t num_resultsBwd = params.numNeighboursBwd;
-  std::vector<size_t> indicesBwd(num_resultsBwd);
-  std::vector<double> sqrDistBwd(num_resultsBwd);
-  nanoflann::KNNResultSet<double> resultSetBwd(num_resultsBwd);
 
   struct DistColor {
     double dist;
@@ -432,16 +451,38 @@ recolourColour(
   std::vector<std::vector<DistColor>> refinedColorsDists2;
   refinedColorsDists2.resize(pointCountTarget);
 
+  // The nearest target points of each source point
+  // NB: the searches are made concurrently, and the results then gathered
+  //     in source order
+  std::vector<size_t> indicesBwdAll(pointCountSource * num_resultsBwd);
+  std::vector<double> sqrDistBwdAll(pointCountSource * num_resultsBwd);
+  parallelFor(
+    pointCountSource, kRecolourGrain, [&](int64_t begin, int64_t end) {
+    std::vector<size_t> indicesBwd(num_resultsBwd);
+    std::vector<double> sqrDistBwd(num_resultsBwd);
+    nanoflann::KNNResultSet<double> resultSetBwd(num_resultsBwd);
+    for (size_t index = begin; index < end; ++index) {
+      resultSetBwd.init(&indicesBwd[0], &sqrDistBwd[0]);
+
+      Vec3<double> posInTgt =
+        source[index] * sourceToTargetScaleFactor - targetToSourceOffset;
+
+      kdtreeTarget.index->findNeighbors(
+        resultSetBwd, &posInTgt[0], nanoflann::SearchParams(10));
+
+      std::copy(
+        indicesBwd.begin(), indicesBwd.end(),
+        &indicesBwdAll[index * num_resultsBwd]);
+      std::copy(
+        sqrDistBwd.begin(), sqrDistBwd.end(),
+        &sqrDistBwdAll[index * num_resultsBwd]);
+    }
+  });
+
   for (size_t index = 0; index < pointCountSource; ++index) {
     const Vec3<attr_t> color = source.getColor(index);
-    resultSetBwd.init(&indicesBwd[0], &sqrDistBwd[0]);
-
-    Vec3<double> posInTgt =
-      source[index] * sourceToTargetScaleFactor - targetToSourceOffset;
-
-    kdtreeTarget.index->findNeighbors(
-      resultSetBwd, &posInTgt[0], nanoflann::SearchParams(10));
-
+    const size_t* indicesBwd = &indicesBwdAll[index * num_resultsBwd];
+    const double* sqrDistBwd = &sqrDistBwdAll[index * num_resultsBwd];
     for (int i = 0; i < num_resultsBwd; ++i) {
       if (sqrDistBwd[i] <= maxGeometryDist2Bwd) {
         refinedColorsDists2[indicesBwd[i]].push_back(
@@ -450,13 +491,16 @@ recolourColour(
     }
   }
 
-  for (size_t index = 0; index < pointCountTarget; ++index) {
-    std::sort(
-      refinedColorsDists2[index].begin(), refinedColorsDists2[index].end(),
-      [](const DistColor& dc1, const DistColor& dc2) {
-        return dc1.dist < dc2.dist;
-      });
-  }
+  parallelFor(
+    pointCountTarget, kRecolourGrain, [&](int64_t begin, int64_t end) {
+    for (size_t index = begin; index < end; ++index) {
+      std::sort(
+        refinedColorsDists2[index].begin(), refinedColorsDists2[index].end(),
+        [](const DistColor& dc1, const DistColor& dc2) {
+          return dc1.dist < dc2.dist;
+        });
+    }
+  });
 
   for (size_t index = 0; index < pointCountTarget; ++index) {
     const Vec3<attr_t> color1 = refinedColors1[index];
@@ -667,10 +711,14 @@ recolourReflectance(
   if (!pointCountSource || !pointCountTarget || !source.hasReflectances()) {
     return false;
   }
-  KDTreeVectorOfVectorsAdaptor<PCCPointSet3, double> kdtreeTarget(
-    3, target, 10);
-  KDTreeVectorOfVectorsAdaptor<PCCPointSet3, double> kdtreeSource(
-    3, source, 10);
+  // NB: the two trees are built concurrently
+  using KdTree = KDTreeVectorOfVectorsAdaptor<PCCPointSet3, double>;
+  std::unique_ptr<KdTree> kdtreeTargetPtr, kdtreeSourcePtr;
+  parallelInvoke(
+    [&] { kdtreeTargetPtr.reset(new KdTree(3, target, 10)); },
+    [&] { kdtreeSourcePtr.reset(new KdTree(3, source, 10)); });
+  const KdTree& kdtreeTarget = *kdtreeTargetPtr;
+  const KdTree& kdtreeSource = *kdtreeSourcePtr;
   target.addReflectances();
   std::vector<attr_t> refinedReflectances1;
   refinedReflectances1.resize(pointCountTarget);
@@ -692,106 +740,113 @@ recolourReflectance(
 
   // Forward direction
   const int num_resultsFwd = cfg.numNeighboursFwd;
-  nanoflann::KNNResultSet<double> resultSetFwd(num_resultsFwd);
-  std::vector<size_t> indicesFwd(num_resultsFwd);
-  std::vector<double> sqrDistFwd(num_resultsFwd);
   // NB: with a limited geometry distance, each full search can change the
   //     state of the forward pass, so every point needs the full search
   const bool tryIdenticalFwd = cfg.skipAvgIfIdenticalSourcePointPresentFwd
     && maxGeometryDist2Fwd == std::numeric_limits<double>::max()
     && sourceToTargetScaleFactor == 1.;
 
-  for (size_t index = 0; index < pointCountTarget; ++index) {
-    resultSetFwd.init(&indicesFwd[0], &sqrDistFwd[0]);
+  // Process the target points [begin, end)
+  // NB: with a limited geometry distance, the neighbour lists can shrink
+  //     from one point to the next, and the points are processed in order;
+  //     otherwise each point is independent
+  auto forwardPass = [&](int64_t begin, int64_t end) {
+    nanoflann::KNNResultSet<double> resultSetFwd(num_resultsFwd);
+    std::vector<size_t> indicesFwd(num_resultsFwd);
+    std::vector<double> sqrDistFwd(num_resultsFwd);
+    for (size_t index = begin; index < end; ++index) {
+      resultSetFwd.init(&indicesFwd[0], &sqrDistFwd[0]);
 
-    Vec3<double> posInSrc =
-      (target[index] + targetToSourceOffset) * targetToSourceScaleFactor;
+      Vec3<double> posInSrc =
+        (target[index] + targetToSourceOffset) * targetToSourceScaleFactor;
 
-    size_t identicalIdx;
-    if (
-      tryIdenticalFwd
-      && findIdenticalPoint(kdtreeSource, posInSrc, &identicalIdx)) {
-      refinedReflectances1[index] = source.getReflectance(identicalIdx);
-      continue;
-    }
-
-    kdtreeSource.index->findNeighbors(
-      resultSetFwd, &posInSrc[0], nanoflann::SearchParams(10));
-
-    while (1) {
-      if (indicesFwd.size() == 1)
-        break;
-
-      if (sqrDistFwd[int(resultSetFwd.size()) - 1] <= maxGeometryDist2Fwd)
-        break;
-
-      sqrDistFwd.pop_back();
-      indicesFwd.pop_back();
-    }
-
-    bool isDone = false;
-    if (cfg.skipAvgIfIdenticalSourcePointPresentFwd) {
-      if (sqrDistFwd[0] < 0.0001) {
-        refinedReflectances1[index] = source.getReflectance(indicesFwd[0]);
-        isDone = true;
-      }
-    }
-
-    if (isDone)
-      continue;
-
-    int nNN = indicesFwd.size();
-    while (nNN > 0 && !isDone) {
-      if (nNN == 1) {
-        refinedReflectances1[index] = source.getReflectance(indicesFwd[0]);
-        isDone = true;
+      size_t identicalIdx;
+      if (
+        tryIdenticalFwd
+        && findIdenticalPoint(kdtreeSource, posInSrc, &identicalIdx)) {
+        refinedReflectances1[index] = source.getReflectance(identicalIdx);
         continue;
       }
 
-      std::vector<attr_t> reflectances;
-      reflectances.resize(0);
-      reflectances.resize(nNN);
-      for (int i = 0; i < nNN; ++i) {
-        reflectances[i] = double(source.getReflectance(indicesFwd[i]));
+      kdtreeSource.index->findNeighbors(
+        resultSetFwd, &posInSrc[0], nanoflann::SearchParams(10));
+
+      while (1) {
+        if (indicesFwd.size() == 1)
+          break;
+
+        if (sqrDistFwd[int(resultSetFwd.size()) - 1] <= maxGeometryDist2Fwd)
+          break;
+
+        sqrDistFwd.pop_back();
+        indicesFwd.pop_back();
       }
-      double maxAttributeDist2 = std::numeric_limits<double>::min();
-      for (int i = 0; i < nNN; ++i) {
-        for (int j = 0; j < nNN; ++j) {
-          const double dist2 = pow(reflectances[i] - reflectances[j], 2);
-          if (dist2 > maxAttributeDist2)
-            maxAttributeDist2 = dist2;
+
+      bool isDone = false;
+      if (cfg.skipAvgIfIdenticalSourcePointPresentFwd) {
+        if (sqrDistFwd[0] < 0.0001) {
+          refinedReflectances1[index] = source.getReflectance(indicesFwd[0]);
+          isDone = true;
         }
       }
-      if (maxAttributeDist2 > maxAttributeDist2Fwd) {
-        --nNN;
-      } else {
-        double refinedReflectance = 0.0;
-        if (cfg.useDistWeightedAvgFwd) {
-          double sumWeights{0.0};
-          for (int i = 0; i < nNN; ++i) {
-            const double weight = 1 / (sqrDistFwd[i] + cfg.distOffsetFwd);
-            refinedReflectance +=
-              source.getReflectance(indicesFwd[i]) * weight;
-            sumWeights += weight;
+
+      if (isDone)
+        continue;
+
+      int nNN = indicesFwd.size();
+      while (nNN > 0 && !isDone) {
+        if (nNN == 1) {
+          refinedReflectances1[index] = source.getReflectance(indicesFwd[0]);
+          isDone = true;
+          continue;
+        }
+
+        std::vector<attr_t> reflectances;
+        reflectances.resize(0);
+        reflectances.resize(nNN);
+        for (int i = 0; i < nNN; ++i) {
+          reflectances[i] = double(source.getReflectance(indicesFwd[i]));
+        }
+        double maxAttributeDist2 = std::numeric_limits<double>::min();
+        for (int i = 0; i < nNN; ++i) {
+          for (int j = 0; j < nNN; ++j) {
+            const double dist2 = pow(reflectances[i] - reflectances[j], 2);
+            if (dist2 > maxAttributeDist2)
+              maxAttributeDist2 = dist2;
           }
-          refinedReflectance /= sumWeights;
-        } else {
-          for (int i = 0; i < nNN; ++i)
-            refinedReflectance += source.getReflectance(indicesFwd[i]);
-          refinedReflectance /= nNN;
         }
-        refinedReflectances1[index] =
-          attr_t(PCCClip(round(refinedReflectance), 0.0, clipMax));
-        isDone = true;
+        if (maxAttributeDist2 > maxAttributeDist2Fwd) {
+          --nNN;
+        } else {
+          double refinedReflectance = 0.0;
+          if (cfg.useDistWeightedAvgFwd) {
+            double sumWeights{0.0};
+            for (int i = 0; i < nNN; ++i) {
+              const double weight = 1 / (sqrDistFwd[i] + cfg.distOffsetFwd);
+              refinedReflectance +=
+                source.getReflectance(indicesFwd[i]) * weight;
+              sumWeights += weight;
+            }
+            refinedReflectance /= sumWeights;
+          } else {
+            for (int i = 0; i < nNN; ++i)
+              refinedReflectance += source.getReflectance(indicesFwd[i]);
+            refinedReflectance /= nNN;
+          }
+          refinedReflectances1[index] =
+            attr_t(PCCClip(round(refinedReflectance), 0.0, clipMax));
+          isDone = true;
+        }
       }
     }
-  }
+  };
+  if (maxGeometryDist2Fwd == std::numeric_limits<double>::max())
+    parallelFor(pointCountTarget, kRecolourGrain, forwardPass);
+  else
+    forwardPass(0, pointCountTarget);
 
   // Backward direction
   const size_t num_resultsBwd = cfg.numNeighboursBwd;
-  std::vector<size_t> indicesBwd(num_resultsBwd);
-  std::vector<double> sqrDistBwd(num_resultsBwd);
-  nanoflann::KNNResultSet<double> resultSetBwd(num_resultsBwd);
 
   struct DistReflectance {
     double dist;
@@ -800,16 +855,38 @@ recolourReflectance(
   std::vector<std::vector<DistReflectance>> refinedReflectancesDists2;
   refinedReflectancesDists2.resize(pointCountTarget);
 
+  // The nearest target points of each source point
+  // NB: the searches are made concurrently, and the results then gathered
+  //     in source order
+  std::vector<size_t> indicesBwdAll(pointCountSource * num_resultsBwd);
+  std::vector<double> sqrDistBwdAll(pointCountSource * num_resultsBwd);
+  parallelFor(
+    pointCountSource, kRecolourGrain, [&](int64_t begin, int64_t end) {
+    std::vector<size_t> indicesBwd(num_resultsBwd);
+    std::vector<double> sqrDistBwd(num_resultsBwd);
+    nanoflann::KNNResultSet<double> resultSetBwd(num_resultsBwd);
+    for (size_t index = begin; index < end; ++index) {
+      resultSetBwd.init(&indicesBwd[0], &sqrDistBwd[0]);
+
+      Vec3<double> posInTgt =
+        source[index] * sourceToTargetScaleFactor - targetToSourceOffset;
+
+      kdtreeTarget.index->findNeighbors(
+        resultSetBwd, &posInTgt[0], nanoflann::SearchParams(10));
+
+      std::copy(
+        indicesBwd.begin(), indicesBwd.end(),
+        &indicesBwdAll[index * num_resultsBwd]);
+      std::copy(
+        sqrDistBwd.begin(), sqrDistBwd.end(),
+        &sqrDistBwdAll[index * num_resultsBwd]);
+    }
+  });
+
   for (size_t index = 0; index < pointCountSource; ++index) {
     const attr_t reflectance = source.getReflectance(index);
-    resultSetBwd.init(&indicesBwd[0], &sqrDistBwd[0]);
-
-    Vec3<double> posInTgt =
-      source[index] * sourceToTargetScaleFactor - targetToSourceOffset;
-
-    kdtreeTarget.index->findNeighbors(
-      resultSetBwd, &posInTgt[0], nanoflann::SearchParams(10));
-
+    const size_t* indicesBwd = &indicesBwdAll[index * num_resultsBwd];
+    const double* sqrDistBwd = &sqrDistBwdAll[index * num_resultsBwd];
     for (int i = 0; i < num_resultsBwd; ++i) {
       if (sqrDistBwd[i] <= maxGeometryDist2Bwd) {
         refinedReflectancesDists2[indicesBwd[i]].push_back(
@@ -818,14 +895,17 @@ recolourReflectance(
     }
   }
 
-  for (size_t index = 0; index < pointCountTarget; ++index) {
-    std::sort(
-      refinedReflectancesDists2[index].begin(),
-      refinedReflectancesDists2[index].end(),
-      [](const DistReflectance& dc1, const DistReflectance& dc2) {
-        return dc1.dist < dc2.dist;
-      });
-  }
+  parallelFor(
+    pointCountTarget, kRecolourGrain, [&](int64_t begin, int64_t end) {
+    for (size_t index = begin; index < end; ++index) {
+      std::sort(
+        refinedReflectancesDists2[index].begin(),
+        refinedReflectancesDists2[index].end(),
+        [](const DistReflectance& dc1, const DistReflectance& dc2) {
+          return dc1.dist < dc2.dist;
+        });
+    }
+  });
 
   for (size_t index = 0; index < pointCountTarget; ++index) {
     const attr_t reflectance1 = refinedReflectances1[index];
@@ -1131,22 +1211,26 @@ orderByAzimuth(
   int numLasers = angularZ.size();
 
   const int kpi = 1<<positionAzimuthScaleLog2-1;
+  // NB: the coordinates of each point are independent and computed
+  //     concurrently
   std::vector<point_t> lidarCoord(pointCount);
-  for (int i = 0; i < pointCount; i++) {
-    auto a = cloud[start + i] - origin;
+  parallelFor(pointCount, kRecolourGrain, [&](int64_t first, int64_t last) {
+    for (int64_t i = first; i < last; i++) {
+      auto a = cloud[start + i] - origin;
 
-    int32_t rA = int32_t(hypot(a[0], a[1])*(1<<8) + 0.5);
-    double dphiA = (atan2(double(a[1]), double(a[0]))+M_PI);
-    if (recipBinWidth != 0.) {
-      dphiA = dphiA * recipBinWidth;
+      int32_t rA = int32_t(hypot(a[0], a[1]) * (1 << 8) + 0.5);
+      double dphiA = (atan2(double(a[1]), double(a[0])) + M_PI);
+      if (recipBinWidth != 0.) {
+        dphiA = dphiA * recipBinWidth;
+      } else {
+        dphiA = dphiA * kpi / M_PI / azimuthSpeed;
+      }
+      int32_t phiIndexA = dphiA + 0.5;
+      int32_t laserIndexA = findLaserPrecise(
+        a, angularTheta.data(), angularZ.data(), numLasers);
+      lidarCoord[i] = {rA, phiIndexA, laserIndexA};
     }
-    else {
-      dphiA = dphiA * kpi / M_PI / azimuthSpeed;
-    }
-    int32_t phiIndexA = dphiA + 0.5;
-    int32_t laserIndexA = findLaserPrecise(a, angularTheta.data(), angularZ.data(), numLasers);
-    lidarCoord[i] = {rA, phiIndexA, laserIndexA};
-  }
+  });
 
 
   std::sort(order.begin(), order.end(), [&](int aIdx, int bIdx) {
