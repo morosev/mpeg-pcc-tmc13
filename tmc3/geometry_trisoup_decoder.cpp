@@ -40,6 +40,7 @@
 #include "pointset_processing.h"
 #include "geometry.h"
 #include "geometry_octree.h"
+#include "lod_scan_simd.h"
 
 namespace pcc {
 
@@ -482,6 +483,52 @@ trisoupVertexArc(int32_t x, int32_t y, int32_t Width_x, int32_t Width_y)
 }
 
 //---------------------------------------------------------------------------
+// Sort the voxels of a block and remove duplicates, with the result of
+// std::sort followed by std::unique.
+//
+// Every voxel is nodepos + v, with v in [0, blockWidth)^3.  The voxels are
+// marked in an occupancy bitmap of the block and read back in increasing
+// index order, (x * blockWidth + y) * blockWidth + z, which is the order of
+// Vec3::operator<.  The bitmap must be zero on entry and is zero on return.
+
+static void
+sortUniqueBlockVoxels(
+  std::vector<Vec3<int32_t>>& voxels,
+  const Vec3<int32_t>& nodepos,
+  int blockWidthLog2,
+  std::vector<uint64_t>& bitmap)
+{
+  const int s = blockWidthLog2;
+  const uint32_t mask = (uint32_t(1) << s) - 1;
+  size_t lo = bitmap.size();
+  size_t hi = 0;
+  for (const auto& voxel : voxels) {
+    const Vec3<int32_t> v = voxel - nodepos;
+    const uint32_t idx =
+      (uint32_t(v[0]) << 2 * s) | (uint32_t(v[1]) << s) | uint32_t(v[2]);
+    bitmap[idx >> 6] |= uint64_t(1) << (idx & 63);
+    lo = std::min(lo, size_t(idx >> 6));
+    hi = std::max(hi, size_t(idx >> 6));
+  }
+
+  voxels.clear();
+  for (size_t w = lo; w <= hi && lo <= hi; w++) {
+    for (int half = 0; half < 2; half++) {
+      uint32_t bits = uint32_t(bitmap[w] >> (32 * half));
+      while (bits) {
+        const uint32_t idx =
+          uint32_t(w * 64 + 32 * half) + lodPopBit<false>(bits);
+        voxels.push_back(
+          nodepos
+          + Vec3<int32_t>{int32_t(idx >> 2 * s), int32_t((idx >> s) & mask),
+                          int32_t(idx & mask)});
+      }
+    }
+    bitmap[w] = 0;
+  }
+}
+
+//---------------------------------------------------------------------------
 bool
 boundaryinsidecheck(const Vec3<int32_t> a, const int bbsize)
 {
@@ -706,6 +753,24 @@ decodeTrisoupCommon(
   // Create list of refined pointss, one leaf at a time.
   std::vector<Vec3<int32_t>> refinedVertices;
 
+  // occupancy bitmap of a block, for sorting the refined voxels
+  // NB: used only for power of two block widths up to 64
+  const int blockWidthLog2 = ilog2(uint32_t(blockWidth));
+  const bool useBitmap =
+    blockWidth == (1 << blockWidthLog2) && blockWidthLog2 <= 6;
+  std::vector<uint64_t> blockBitmap;
+  if (useBitmap)
+    blockBitmap.assign(((size_t(1) << 3 * blockWidthLog2) + 63) >> 6, 0);
+  auto sortUniqueBlock = [&](std::vector<Vec3<int32_t>>& voxels,
+                             const Vec3<int32_t>& nodepos) {
+    if (useBitmap) {
+      sortUniqueBlockVoxels(voxels, nodepos, blockWidthLog2, blockBitmap);
+    } else {
+      std::sort(voxels.begin(), voxels.end());
+      voxels.erase(std::unique(voxels.begin(), voxels.end()), voxels.end());
+    }
+  };
+
   // ----------- loop on leaf nodes ----------------------
   for (int i = 0; i < leaves.size(); i++) {
 
@@ -733,10 +798,7 @@ decodeTrisoupCommon(
 
     // Skip leaves that have fewer than 3 vertices.
     if (eVerts[i].vertices.size() < 3) {
-      std::sort(refinedVerticesBlock.begin(), refinedVerticesBlock.end());
-      refinedVerticesBlock.erase(
-        std::unique(refinedVerticesBlock.begin(), refinedVerticesBlock.end()),
-        refinedVerticesBlock.end());
+      sortUniqueBlock(refinedVerticesBlock, nodepos);
       refinedVertices.insert(
         refinedVertices.end(),
         refinedVerticesBlock.begin(), refinedVerticesBlock.end());
@@ -821,10 +883,7 @@ decodeTrisoupCommon(
       }
     }  // end loop on triangles
 
-    std::sort(refinedVerticesBlock.begin(), refinedVerticesBlock.end());
-    refinedVerticesBlock.erase(
-      std::unique(refinedVerticesBlock.begin(), refinedVerticesBlock.end()),
-      refinedVerticesBlock.end());
+    sortUniqueBlock(refinedVerticesBlock, nodepos);
     refinedVertices.insert(
       refinedVertices.end(),
       refinedVerticesBlock.begin(), refinedVerticesBlock.end());
