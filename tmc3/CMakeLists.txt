@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.10)
 enable_language(C)
 
 if (UNIX)
@@ -203,12 +203,6 @@ include_directories(
   "${CMAKE_CURRENT_SOURCE_DIR}/../dependencies/program-options-lite"
 )
 
-# Hide the symbols of the codec in the shared library (only the C
-# interface is exported)
-if (POLICY CMP0063)
-  cmake_policy(SET CMP0063 NEW)
-endif()
-
 # The codec, shared by the tmc3 application and the tmc3codec library
 add_library (tmc3core STATIC
   ${PROJECT_CPP_FILES}
@@ -217,6 +211,8 @@ add_library (tmc3core STATIC
   ${VERSION_FILE}
 )
 add_dependencies(tmc3core genversion)
+# NB: symbols are hidden so that the shared library only exports the C
+#     interface
 set_target_properties(tmc3core PROPERTIES
   POSITION_INDEPENDENT_CODE ON
   CXX_VISIBILITY_PRESET hidden

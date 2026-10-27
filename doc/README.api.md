@@ -40,9 +40,9 @@ CMake builds three targets from `tmc3/CMakeLists.txt`:
 The application and the library share the option parsing and the input and
 output conversions (`tmc3/app_params.cpp`), so that both behave the same.
 
-The CMake targets have not been built yet: the library was tested with
-equivalent direct compiler commands on macOS (`-fvisibility=hidden`, a
-`-dynamiclib` link of the codec objects and `tmc3_api.cpp`).
+CMake 3.10 or later is required.  The targets have been built and tested
+with CMake 4.4 on macOS; Linux and Windows (MSVC) builds of the library
+have not been tested yet.
 
 
 Point data
