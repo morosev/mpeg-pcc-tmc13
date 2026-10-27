@@ -416,6 +416,83 @@ first column is the code before the loop restructuring and parallel work
 - ThreadSanitizer reports no data races with 4 threads for the lidar and
   dense configurations.
 
+### Parallel slices
+
+When a frame is coded as several slices, the slices can also be coded
+concurrently.  Splitting a spinning lidar frame into angular sectors
+(spans of the azimuth-ordered input) suits this well, and corresponds to
+how a sensor delivers the data:
+
+    --partitionMethod=5 --sliceMaxPoints=36000 --sliceMinPoints=18000
+
+gives four sectors per frame for the ~143k-point frames used here.  The
+choice of slices is an encoder configuration and changes the bitstream;
+coding the slices concurrently does not.
+
+Slices are coded concurrently only without inter prediction, bi-prediction,
+global motion and entropy continuation, where each slice starts from reset
+contexts.  Otherwise, and for partial decoding (`decodeMaxPoints`,
+`skipOctreeLayers`), slices are coded in order as before.
+
+- Decoder (`tmc3/decoder.cpp`): the slices of a frame are queued, each
+  with its own decoder initialised from the decoder state at the time the
+  slice starts.  They are decoded when the frame ends or before any data
+  unit that changes the decoder state (parameter sets, inventories), and
+  the points and messages are merged in slice order.  If an attribute
+  data unit of a queued slice uses attribute inter prediction (which
+  refers to the previous slice), the queued slices are decoded in order by
+  the main decoder instead.
+- Encoder (`tmc3/encoder.cpp`): each partition is encoded by its own
+  encoder with its own copy of the encoder parameters (the slice header
+  template is written per slice); the data units, recolouring output,
+  reconstructions and messages are emitted in slice order.  An error in a
+  slice is reported after the preceding slices have been emitted.
+- Messages written while coding a slice concurrently, including those of
+  the trisoup coder (`codingLog()`, `tmc3/parallel.h`), are buffered so
+  that the log is in the same order as for sequential coding.
+- Worker threads are created with the stack size of the main thread: the
+  coding functions use large stack frames, and secondary threads otherwise
+  get a smaller stack (512 kB on macOS).
+- When the slices of a frame are coded concurrently, the parallel sections
+  within a slice run on the thread coding that slice.
+
+Results (Apple M5 Pro, 30 synthetic Ford-like lidar frames, end-to-end
+wall time per frame, best of two runs; the size is relative to one slice
+per frame):
+
+| Configuration | Sectors | Size | 1 thread | 2 threads | 4 threads | 8 threads |
+|---|---|---|---|---|---|---|
+| predgeom + predicting, encode | 4 | +1.5% | 88.5 ms | 41.5 ms | 22.7 ms | 22.6 ms |
+| predgeom + predicting, decode | 4 | +1.5% | 56.7 ms | 28.4 ms | 15.4 ms | 15.6 ms |
+| predgeom + lifting, encode | 4 | +2.1% | 95.6 ms | 45.2 ms | 24.8 ms | 24.6 ms |
+| predgeom + lifting, decode | 4 | +2.1% | 63.3 ms | 31.7 ms | 17.2 ms | 17.5 ms |
+| octree + predicting, encode | 4 | +1.1% | 257.4 ms | 140.4 ms | 77.2 ms | 76.9 ms |
+| octree + predicting, decode | 4 | +1.1% | 134.4 ms | 68.7 ms | 37.4 ms | 37.3 ms |
+| octree + lifting, encode | 4 | +2.1% | 234.3 ms | 153.4 ms | 84.1 ms | 84.7 ms |
+| octree + lifting, decode | 4 | +2.1% | 77.1 ms | 46.3 ms | 26.6 ms | 26.8 ms |
+| octree + predicting, encode | 8 | +1.6% | 250.2 ms | 135.3 ms | 74.9 ms | 48.0 ms |
+| octree + predicting, decode | 8 | +1.6% | 134.8 ms | 68.9 ms | 37.0 ms | 23.2 ms |
+| octree + lifting, encode | 8 | +2.8% | 229.3 ms | 146.0 ms | 79.8 ms | 52.6 ms |
+| octree + lifting, decode | 8 | +2.8% | 75.6 ms | 43.4 ms | 26.0 ms | 17.2 ms |
+
+With four sectors and four threads, every lidar configuration encodes and
+decodes within 100 ms per frame (the 10 Hz target), including octree
+geometry.  Scaling follows the number of slices: four threads for four
+sectors, eight for eight.
+
+Verification:
+
+- Decoding 17 multi-slice streams (4 and 8 sectors, square partitions of
+  ~22 slices per frame, dense RAHT, lifting and trisoup, inter prediction,
+  point count metadata with `decodeMaxPoints`) with 1, 2, 4 and 15
+  threads gives reconstructions and logs (except timing values) identical
+  to the previous decoder.
+- Encoding ten multi-slice configurations (including tiles, inter
+  prediction and trisoup) with 1, 2, 4 and 15 threads gives bitstreams,
+  reconstructions and logs identical to the previous encoder.
+- ThreadSanitizer reports no races and AddressSanitizer no errors; the x86
+  SSE4.1 build under Rosetta 2 gives identical results.
+
 
 Remaining work
 --------------
@@ -430,9 +507,10 @@ Remaining work
 - Single-threaded predgeom + lifting encode remains close to 100 ms; the
   remaining time is mostly the LoD candidate scans, the arithmetic coder,
   `atan2` and the laser search of the input azimuth sort.
-- Octree geometry coding, which now dominates octree lidar encode and
-  decode, is serial; independent slices could be coded in parallel where
-  slices do not share entropy state or references.
+- Octree geometry coding remains serial within a slice; real-time octree
+  coding relies on coding several slices per frame concurrently.
+- Parallel slice coding with inter prediction: slices of a frame only
+  depend on the reference frame, which could be shared read-only.
 - RAHT: check whether the transform's operands fit 32 bits for SIMD.
 - Trisoup: vectorise `rayTracingAlongdirection`.
 - Measure the parallel scaling on Intel and AMD processors, and with the
