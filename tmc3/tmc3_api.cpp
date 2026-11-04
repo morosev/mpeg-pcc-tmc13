@@ -35,6 +35,7 @@
 
 #include "tmc3_api.h"
 
+#include <cmath>
 #include <cstring>
 #include <deque>
 #include <exception>
@@ -379,14 +380,20 @@ tmc3_encoder::readCloud(const tmc3_cloud& in, PCCPointSet3& cloud)
   cloud.addRemoveAttributes(codeColour, codeRefl);
   cloud.resize(n);
 
-  // NB: as ply::read, positions are scaled in double precision and
-  //     truncated
+  // NB: positions are scaled in double precision and floored, unlike
+  //     ply::read, which truncates toward zero. Coded positions are relative
+  //     to a fixed origin (seqOrigin), so the step a point falls in must not
+  //     depend on its sign: truncation toward zero rounds a negative
+  //     coordinate up, into the next step, and moved points across any
+  //     boundary a consumer quantises at (a voxel grid, say) wherever the
+  //     cloud lies below zero.
   const double scale = params.inputScale;
   for (int k = 0; k < 3; k++) {
     int c = axisComponent[k];
     forEachValue<double>(
-      pos, in.position.dtype, k, n,
-      [&](int64_t i, double v) { cloud[i][c] = int32_t(v * scale); });
+      pos, in.position.dtype, k, n, [&](int64_t i, double v) {
+        cloud[i][c] = int32_t(std::floor(v * scale));
+      });
   }
 
   if (codeColour)
